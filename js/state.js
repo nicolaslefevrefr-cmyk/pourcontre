@@ -1,0 +1,1700 @@
+/* state.js — application state and model operations (no DOM) */
+(function () {
+  'use strict';
+  const APP = window.APP = { hooks: {} };
+  const V = FK.V, fmt = FK.fmt;
+
+  const S = APP.S = {
+    model: { title: 'Geometry', bodies: [], regions: [], tail: [], csys: [], active: 0, groups: [], components: [], materials: FK.defaultMaterials() },
+    measures: [], stls: [], nextId: 1,
+    sel: null, filter: 'face', tool: 'select',
+    pick: null, pending: null, W: null,
+    opt: { defV2: true, render: 'opaque', edges: true, invX: false, invY: false, names: 'off', pieceHl: true, snap: true, coplanar: true, coTol: 1, sharp: 20, edgeSoft: true, ptMode: 'vertex', edgeSharpOnly: true, circleAll: false,
+      margin: 10, style: 2, theme: 'light', inpFull: true, inpTransform: false, v118: true, axes: true, scale: { mode: 'margin', val: 20, unit: 'mm' } }
+  };
+  APP.nid = () => S.nextId++;
+  APP.getBody = (id) => S.model.bodies.find(b => b.id === id);
+  APP.getRegion = (id) => S.model.regions.find(r => r.id === id);
+  /** Colour of a material in the "colour by material" view: a fixed palette by position in the list; grey when no material. */
+  const MAT_PAL = ['#e6194b', '#3cb44b', '#4363d8', '#f58231', '#911eb4', '#0aa5b8', '#c9a800', '#e6559e', '#7a9a01', '#8b5a2b', '#5c6bc0', '#00897b', '#d84315', '#6d4c9f', '#43a047', '#ad1457'];
+  APP.materialColor = (id) => { const i = (S.model.materials || []).findIndex(m => m.id === id); return i < 0 ? '#b8bec6' : MAT_PAL[i % MAT_PAL.length]; };
+  APP.getMaterial = (id) => (S.model.materials || []).find(m => m.id === id);
+  APP.getComp = (id) => (S.model.components || []).find(c => c.id === id);
+  APP.getStl = (id) => S.stls.find(s => s.id === id);
+  APP.getMeasure = (id) => S.measures.find(m => m.id === id);
+  APP.selItem = function () {
+    if (!S.sel) return null;
+    const g = { body: APP.getBody, region: APP.getRegion, stl: APP.getStl, measure: APP.getMeasure, csys: (id) => APP.getCsys(id), comp: APP.getComp, material: APP.getMaterial }[S.sel.t];
+    return g ? g(S.sel.id) || null : null;
+  };
+  APP.changed = (f) => { if (APP.syncComps) APP.syncComps(); if (APP.syncAuto) APP.syncAuto(); if (APP.syncLinks) APP.syncLinks(); if (APP.hooks.changed) APP.hooks.changed(f || {}); };
+  APP.toast = (m) => { if (APP.hooks.toast) APP.hooks.toast(m); };
+  const color = (i) => FK.PALETTE[i % FK.PALETTE.length];
+
+  /* ---------- Undo / redo ---------- */
+  const undoStack = [], redoStack = [];
+  let lastKey = null, lastT = 0;
+  const serialize = () => JSON.stringify({ model: S.model, measures: S.measures });
+  APP.snap = function (key) {
+    const now = Date.now();
+    if (key && key === lastKey && now - lastT < 1200) { lastT = now; return; }
+    undoStack.push(serialize()); if (undoStack.length > 80) undoStack.shift();
+    redoStack.length = 0; lastKey = key || null; lastT = now;
+    APP.hooks.undoState && APP.hooks.undoState();
+  };
+  function restore(str) {
+    const o = JSON.parse(str);
+    S.model = o.model; S.measures = o.measures;
+    S.model.csys = S.model.csys || []; S.model.active = S.model.active || 0; S.model.groups = S.model.groups || []; S.model.components = S.model.components || []; S.model.materials = S.model.materials || FK.defaultMaterials();
+    if (S.sel && !APP.selItem() && S.sel.t !== 'stl') S.sel = null;
+    APP.changed({ tree: true, right: true, measures: true });
+  }
+  APP.undo = function () { if (!undoStack.length) return; redoStack.push(serialize()); restore(undoStack.pop()); lastKey = null; APP.hooks.undoState && APP.hooks.undoState(); };
+  APP.redo = function () { if (!redoStack.length) return; undoStack.push(serialize()); restore(redoStack.pop()); lastKey = null; APP.hooks.undoState && APP.hooks.undoState(); };
+  APP.canUndo = () => undoStack.length > 0; APP.canRedo = () => redoStack.length > 0;
+
+  /* ---------- Local storage ---------- */
+  const KEY = 'fluka-geo-tool-v1';
+  const stlMeta = (m) => ({ id: m.id, name: m.name, format: m.format || 'STL', unit: m.unit, offset: m.offset, flip: !!m.flip, visible: m.visible, opacity: m.opacity, color: m.color, edges: m.edges, grp: m.grp || 0, steps: m.steps || [], n: m.raw ? m.raw.length : 0 });
+  APP.save = function () {
+    if (APP.holdSave) return;                       // start-up: the previous session is still waiting for the user's choice, do not overwrite it
+    try { localStorage.setItem(KEY, JSON.stringify({ saved: Date.now(), model: S.model, measures: S.measures, opt: S.opt, nextId: S.nextId, filter: S.filter, stls: S.stls.map(stlMeta) })); } catch (e) { /* quota / private mode */ }
+    clearTimeout(APP._meshT); APP._meshT = setTimeout(() => APP.persistMeshes(), 600);
+  };
+  /* The triangles of the meshes are kept in IndexedDB (too big for localStorage), so that a page reload brings the meshes back. */
+  const idbOpen = () => new Promise((res, rej) => { if (typeof indexedDB === 'undefined') return rej(new Error('no IndexedDB')); const r = indexedDB.open('fgt-meshes', 1); r.onupgradeneeded = () => r.result.createObjectStore('raw', { keyPath: 'id' }); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+  const reqP = (rq) => new Promise((res, rej) => { rq.onsuccess = () => res(rq.result); rq.onerror = () => rej(rq.error); });
+  const rawStored = new Set();
+  /** Rigid transform (world matrix, cm) added to the mesh's list of steps. The triangles stay as imported; the steps are saved with the project. */
+  APP.transformStl = function (stl, mw, label, desc) {
+    (stl.steps = stl.steps || []).push({ label: label || 'Transform', m: mw.slice(), d: desc || null });
+    APP.buildStl(stl);
+  };
+  APP.removeStlStep = function (stl, i) { if (!stl.steps || !stl.steps[i]) return; stl.steps.splice(i, 1); APP.buildStl(stl); };
+  APP.cleanSteps = (a) => Array.isArray(a) ? a.filter(x => x && Array.isArray(x.m) && x.m.length === 12 && x.m.every(isFinite)).map(x => ({ label: String(x.label || 'Transform'), m: x.m.slice(), d: x.d || null })) : [];
+  APP.persistMeshes = async function () {
+    try {
+      const db = await idbOpen(), tx = db.transaction('raw', 'readwrite'), st = tx.objectStore('raw');
+      const keep = new Set(S.stls.map(m => m.id));
+      for (const k of await reqP(st.getAllKeys())) if (!keep.has(k)) { st.delete(k); for (const x of [...rawStored]) if (x.startsWith(k + ':')) rawStored.delete(x); }
+      for (const m of S.stls) { const key = m.id + ':' + (m.raw ? m.raw.length : 0); if (m.raw && !rawStored.has(key)) { st.put({ id: m.id, raw: m.raw }); rawStored.add(key); } }
+      await new Promise((res, rej) => { tx.oncomplete = res; tx.onerror = () => rej(tx.error); tx.onabort = () => rej(tx.error); });
+      db.close();
+    } catch (e) { /* private mode / quota: the meshes simply are not kept */ }
+  };
+  /** After a page reload: rebuilds the meshes listed in the local storage from IndexedDB. Returns the number restored. */
+  APP.restoreMeshes = async function () {
+    let n = 0;
+    try {
+      const o = JSON.parse(localStorage.getItem(KEY) || 'null'); const meta = (o && o.stls) || []; if (!meta.length) return 0;
+      const db = await idbOpen(), st = db.transaction('raw', 'readonly').objectStore('raw');
+      for (const m of meta) {
+        const rec = await reqP(st.get(m.id)); if (!rec || !rec.raw || S.stls.some(x => x.id === m.id)) continue;
+        const raw = rec.raw instanceof Float32Array ? rec.raw : new Float32Array(rec.raw);
+        const s = { id: m.id, name: m.name, format: m.format || 'STL', raw, unit: m.unit || 'mm', offset: m.offset || [0, 0, 0], flip: !!m.flip, visible: m.visible !== false, opacity: m.opacity === undefined ? 0.6 : m.opacity, color: m.color || '#8f9bb0', edges: !!m.edges, grp: m.grp || 0, steps: APP.cleanSteps(m.steps), group: null, mesh: null };
+        APP.buildStl(s); S.stls.push(s); rawStored.add(s.id + ':' + raw.length); n++;
+      }
+      db.close();
+    } catch (e) { return n; }
+    if (n) APP.changed({ tree: true, right: true });
+    return n;
+  };
+  /** What the previous session left in the local storage (null when nothing worth restoring). */
+  APP.peekSession = function () {
+    try {
+      const o = JSON.parse(localStorage.getItem(KEY) || 'null'); if (!o || !o.model) return null;
+      const b = (o.model.bodies || []).length, r = (o.model.regions || []).length, m = (o.stls || []).length;
+      return b + r + m ? { bodies: b, regions: r, meshes: m, saved: o.saved || 0 } : null;
+    } catch (e) { return null; }
+  };
+  /** The user does not want the previous session: its model and meshes are removed from the storage. */
+  APP.discardSession = function () {
+    try { localStorage.removeItem(KEY); } catch (e) { /* ignore */ }
+    APP.holdSave = false; APP.save();
+  };
+  /** settingsOnly: only the preferences are read (the model, the meshes and the measures stay empty until the user agrees to restore them). */
+  APP.load = function (settingsOnly) {
+    try {
+      const raw = localStorage.getItem(KEY); if (!raw) return false;
+      const o = JSON.parse(raw);
+      if (settingsOnly) {
+        Object.assign(S.opt, o.opt || {});
+        if (!(o.opt && o.opt.defV2)) { S.opt.render = 'opaque'; S.opt.edges = true; S.opt.invX = false; S.opt.invY = false; S.opt.defV2 = true; }
+        if (!(o.opt && o.opt.v118)) { S.opt.style = 2; S.opt.inpFull = true; S.opt.v118 = true; }
+        S.opt.scale = Object.assign({ mode: 'margin', val: 20, unit: 'mm' }, (o.opt || {}).scale);
+        if (o.filter) S.filter = o.filter;
+        return true;
+      }
+      if (o.model && Array.isArray(o.model.bodies)) {
+        S.model = o.model; S.model.tail = S.model.tail || []; S.model.csys = S.model.csys || []; S.model.active = S.model.active || 0; S.model.groups = S.model.groups || []; S.model.components = S.model.components || []; S.model.materials = S.model.materials || FK.defaultMaterials();
+        S.measures = o.measures || []; S.nextId = o.nextId || 1000;
+        Object.assign(S.opt, o.opt || {});
+        if (!(o.opt && o.opt.defV2)) { S.opt.render = 'opaque'; S.opt.edges = true; S.opt.invX = false; S.opt.invY = false; S.opt.defV2 = true; }   // new defaults, applied once
+        if (!(o.opt && o.opt.v118)) { S.opt.style = 2; S.opt.inpFull = true; S.opt.v118 = true; }   // new defaults (compact aligned style, complete input file), applied once
+        S.opt.scale = Object.assign({ mode: 'margin', val: 20, unit: 'mm' }, (o.opt || {}).scale);
+        if (o.filter) S.filter = o.filter;
+        let mx = S.nextId; for (const a of [S.model.bodies, S.model.regions, S.measures, S.model.csys, o.stls || []]) for (const x of a) mx = Math.max(mx, (x.id || 0) + 1);
+        S.nextId = mx; APP.sanitizeNames();
+        return true;
+      }
+    } catch (e) { /* ignorer */ }
+    return false;
+  };
+
+  /* ---------- Coordinate systems (csys) ----------
+   * csys = { id, name, parent (0 = global), frozen, m (3×4 local, relative to the parent), visible, color }
+   * body.cs = id of the csys in which the body parameters are expressed (0 = global). */
+  const M = FK.M;
+  APP.getCsys = (id) => id ? S.model.csys.find(c => c.id === id) : null;
+  const csysNames = () => new Set(S.model.csys.map(c => c.name));
+  /** world matrix of a csys (0 / unknown → identity); guards against cycles */
+  APP.csysWorld = function (id, guard) {
+    let m = M.id(), n = 0;
+    const chain = [];
+    while (id && n++ < 64) { const c = APP.getCsys(id); if (!c) break; chain.push(c); id = c.parent; }
+    for (let i = chain.length - 1; i >= 0; i--) m = M.mul(m, chain[i].m);
+    return m;
+  };
+  APP.csysDepth = function (id) { let n = 0; while (id && n < 64) { const c = APP.getCsys(id); if (!c) break; n++; id = c.parent; } return n; };
+  APP.isDescendant = function (id, anc) { let n = 0; while (id && n++ < 64) { if (id === anc) return true; const c = APP.getCsys(id); if (!c) return false; id = c.parent; } return false; };
+  APP.csysChildren = (id) => S.model.csys.filter(c => (c.parent || 0) === id);
+  APP.wbody = (b) => b.cs ? FK.worldBody(b, APP.csysWorld(b.cs)) : b;
+  /** Export csys (one only, 0 = global): the INP is written in this frame. */
+  APP.exportCs = () => { const id = S.model.exportCs || 0; return id && APP.getCsys(id) ? id : 0; };
+  /** Body expressed in the export frame (what is written in the INP). */
+  APP.xbody = function (b) {
+    const ex = APP.exportCs();
+    if (!ex) return APP.wbody(b);
+    if (b.type === 'RAW') return b;
+    return FK.worldBody(b, M.mul(M.inv(APP.csysWorld(ex)), APP.csysWorld(b.cs || 0)));
+  };
+  /** Matrix local frame of a body → export frame. */
+  APP.relM = function (b) {
+    const cw = APP.csysWorld(b.cs || 0), ex = APP.exportCs();
+    return ex ? FK.M.mul(FK.M.inv(APP.csysWorld(ex)), cw) : cw;
+  };
+  /** Applies a fix proposed by FK.checkAlignment (descriptors are in the export frame). Returns { ok, msg }. */
+  APP.applyFix = function (fx) {
+    if (fx.type === 'merge') {                              // identical planes of the INP: accepted as a merge (same as Check ▸ Compact)
+      APP.snap(); for (const d of fx.drops) (S.model.merges = S.model.merges || []).push({ keep: fx.keep, drop: d.name, sign: d.sign, tolA: Math.max(fx.tolA, d.dn) * 1.01 + 1e-12, tolD: Math.max(fx.tolD, d.dd) * 1.01 + 1e-12 });
+      return { ok: true, msg: `${fx.drops.length} plane${fx.drops.length > 1 ? 's' : ''} merged into ${fx.keep}` };
+    }
+    const M = FK.M, V = FK.V, find = (n) => S.model.bodies.find(b => b.name === n);
+    const B = find(fx.name), R = fx.ref ? find(fx.ref) : null;
+    if (!B || (fx.ref && !R)) return { ok: false, msg: 'Body not found' };
+    const rel = APP.relM(B), toLocalV = (v) => M.applyVec(M.inv(rel), v), toLocalP = (q) => M.apply(M.inv(rel), q);
+    const clean = (n) => n.map(x => Math.abs(x) < 1e-12 ? 0 : Math.abs(Math.abs(x) - 1) < 1e-12 ? Math.sign(x) : x);
+    const isCyl = (b) => b.type === 'RCC' || b.type === 'TRC', isInf = (b) => b.type === 'XCC' || b.type === 'YCC' || b.type === 'ZCC';
+    const axisOf = (b) => { const x = APP.xbody(b), p = x.p; if (x.type === 'RCC' || x.type === 'TRC') { const H = [p[3], p[4], p[5]], L = V.len(H); return { o: [p[0], p[1], p[2]], d: V.mul(H, 1 / L) }; } if (x.type === 'XCC') return { o: [0, p[0], p[1]], d: [1, 0, 0] }; if (x.type === 'YCC') return { o: [p[1], 0, p[0]], d: [0, 1, 0] }; if (x.type === 'ZCC') return { o: [p[0], p[1], 0], d: [0, 0, 1] }; return null; };
+    switch (fx.type) {
+      case 'snapAxis': {
+        if (!isCyl(B)) return { ok: false, msg: 'Not a cylinder' };
+        const t = V.mul([0, 0, 0].map((_, i) => i === fx.axis ? 1 : 0), fx.sign), l = toLocalV(t), n = clean(V.norm(l)), L = +V.len([B.p[3], B.p[4], B.p[5]]).toPrecision(12);
+        APP.snap(); B.p[3] = n[0] * L; B.p[4] = n[1] * L; B.p[5] = n[2] * L; for (let i = 3; i < 6; i++) if (Math.abs(B.p[i]) < 1e-12 * L) B.p[i] = 0;
+        return { ok: true, msg: `${B.name}: axis set exactly on ${'XYZ'[fx.axis]}` };
+      }
+      case 'snapPlane': {
+        if (B.type !== 'PLA') return { ok: false, msg: 'Not an oblique plane' };
+        const t = [0, 0, 0].map((_, i) => i === fx.axis ? fx.sign : 0), l = toLocalV(t), n = clean(V.norm(l)), L = V.len([B.p[0], B.p[1], B.p[2]]) || 1;
+        APP.snap();
+        if (M.isTranslation(rel, 1e-9) && fx.sign > 0) { const c = B.p[3 + fx.axis]; B.type = ['YZP', 'XZP', 'XYP'][fx.axis]; B.p = [c]; return { ok: true, msg: `${B.name}: converted to ${B.type}` }; }
+        B.p[0] = n[0] * L; B.p[1] = n[1] * L; B.p[2] = n[2] * L; for (let i = 0; i < 3; i++) if (Math.abs(B.p[i]) < 1e-12 * L) B.p[i] = 0;
+        return { ok: true, msg: `${B.name}: normal set exactly on ${fx.sign > 0 ? '+' : '−'}${'XYZ'[fx.axis]}` };
+      }
+      case 'align': {
+        if (!isCyl(B)) return { ok: false, msg: 'Only RCC / TRC axes can be re-oriented' };
+        const ra = fx.ref ? axisOf(R) : null, d = ra ? ra.d : fx.d; if (!d) return { ok: false, msg: 'No reference axis' };
+        const cur = axisOf(B), sg = V.dot(cur.d, d) >= 0 ? 1 : -1, l = clean(V.norm(toLocalV(V.mul(d, sg)))), L = +V.len([B.p[3], B.p[4], B.p[5]]).toPrecision(12);
+        APP.snap(); B.p[3] = l[0] * L; B.p[4] = l[1] * L; B.p[5] = l[2] * L;
+        return { ok: true, msg: `${B.name}: axis aligned with ${R ? R.name : 'the reference'}` };
+      }
+      case 'concentric': {
+        const A = axisOf(R), C = axisOf(B); if (!A || !C) return { ok: false, msg: 'Unsupported bodies' };
+        const w = V.sub(C.o, A.o), perp = V.sub(w, V.mul(A.d, V.dot(w, A.d))), l = toLocalV(V.mul(perp, -1));
+        APP.snap();
+        if (isCyl(B)) { B.p[0] += l[0]; B.p[1] += l[1]; B.p[2] += l[2]; }
+        else if (B.type === 'XCC') { B.p[0] += l[1]; B.p[1] += l[2]; } else if (B.type === 'YCC') { B.p[0] += l[2]; B.p[1] += l[0]; } else if (B.type === 'ZCC') { B.p[0] += l[0]; B.p[1] += l[1]; }
+        else return { ok: false, msg: 'Unsupported body' };
+        return { ok: true, msg: `${B.name}: axis moved onto the axis of ${R.name}` };
+      }
+      case 'radius': {
+        const ra = APP.xbody(R).p, xb = APP.xbody(R), rr = xb.type === 'RCC' ? [ra[6]] : xb.type === 'TRC' ? [ra[6], ra[7]] : [ra[2]];
+        const idx = B.type === 'RCC' ? [6] : B.type === 'TRC' ? [6, 7] : isInf(B) ? [2] : null; if (!idx) return { ok: false, msg: 'Unsupported body' };
+        APP.snap(); let n = 0;
+        for (const i of idx) { let best = null; for (const x of rr) { const dd = Math.abs(x - B.p[i]); if (dd > 1e-9 && dd < (fx.tol || 1e-3) && (!best || dd < best.dd)) best = { x, dd }; } if (best) { B.p[i] = best.x; n++; } }
+        return n ? { ok: true, msg: `${B.name}: radius set equal to ${R.name}'s` } : { ok: false, msg: 'Nothing to change' };
+      }
+      case 'shift': {
+        if (!isCyl(B)) return { ok: false, msg: 'Only RCC / TRC can be translated this way' };
+        const l = toLocalV(fx.delta); APP.snap(); B.p[0] += l[0]; B.p[1] += l[1]; B.p[2] += l[2];
+        return { ok: true, msg: `${B.name}: translated by ${(V.len(fx.delta) * 10).toPrecision(3)} mm along its axis` };
+      }
+      case 'planeMerge': {
+        const pa = APP.xbody(R), pb = APP.xbody(B); if (!FK.isPlaneType(pa.type) || !FK.isPlaneType(pb.type)) return { ok: false, msg: 'Not planes' };
+        const qa = FK.planeOf(pa), qb = FK.planeOf(pb), na = V.norm(qa.H), sg = V.dot(na, V.norm(qb.H)) >= 0 ? 1 : -1, n = V.mul(na, sg);
+        const dist = V.dot(na, V.sub(qb.V, qa.V)), v = V.sub(qb.V, V.mul(na, dist));
+        const ln = V.norm(toLocalV(n)), lv = toLocalP(v), L = B.type === 'PLA' ? V.len([B.p[0], B.p[1], B.p[2]]) || 1 : 1;
+        APP.snap(); B.type = 'PLA'; B.p = [ln[0] * L, ln[1] * L, ln[2] * L, lv[0], lv[1], lv[2]];
+        return { ok: true, msg: `${B.name}: plane made coincident with ${R.name}` };
+      }
+      case 'face': {
+        if (!M.isTranslation(rel, 1e-9)) return { ok: false, msg: 'Body in a rotated coordinate system: edit it manually' };
+        if (B.type !== 'RPP' && !['XYP', 'XZP', 'YZP'].includes(B.type)) return { ok: false, msg: 'Unsupported body' };
+        APP.snap(); B.p[fx.idx] = fx.value - rel[[3, 7, 11][fx.axis]];
+        return { ok: true, msg: `${B.name}: ${'XYZ'[fx.axis]} face moved onto ${R.name}'s` };
+      }
+    }
+    return { ok: false, msg: 'Unknown fix' };
+  };
+
+  /* ---------- Compact: coordinate systems that are (almost) the same ---------- */
+  const CS_TYPES = new Set(['SPH', 'RCC', 'TRC', 'PLA', 'XYP', 'XZP', 'YZP', 'RPP', 'XCC', 'YCC', 'ZCC']);
+  function localRef(b) {
+    const p = b.p;
+    switch (b.type) {
+      case 'PLA': return [p[3], p[4], p[5]]; case 'XYP': return [0, 0, p[0]]; case 'XZP': return [0, p[0], 0]; case 'YZP': return [p[0], 0, 0];
+      case 'XCC': return [0, p[0], p[1]]; case 'YCC': return [p[1], 0, p[0]]; case 'ZCC': return [p[0], p[1], 0];
+    }
+    const bb = FK.bodyBBox(b); return [0, 1, 2].map(k => (bb.min[k] + bb.max[k]) / 2);
+  }
+  /** Body of frame `from` re-expressed in frame `to` by a pure translation (the small rotation between the frames is dropped). Returns { body, shift } (shift = largest displacement of the corners, cm). */
+  function reexpress(b, rel) {
+    const c = localRef(b), q = M.apply(rel, c), t = [q[0] - c[0], q[1] - c[1], q[2] - c[2]];
+    const nb = FK.worldBody(JSON.parse(JSON.stringify(b)), M.translation(t));
+    let shift = 0;
+    if (!FK.isInfiniteType(b.type)) { const bb = FK.bodyBBox(b); for (const x of [bb.min[0], bb.max[0]]) for (const y of [bb.min[1], bb.max[1]]) for (const z of [bb.min[2], bb.max[2]]) { const a = M.apply(rel, [x, y, z]); shift = Math.max(shift, Math.hypot(a[0] - x - t[0], a[1] - y - t[1], a[2] - z - t[2])); } }
+    return { body: nb, shift };
+  }
+  /** Proposals [{ from, to, deg, shift, bodies:[id], children:[id] }] for csys whose orientation differs by less than tolDeg and whose bodies move by less than tolD (cm). */
+  APP.findCsysMerges = function (tolDeg, tolD) {
+    const cs = S.model.csys, out = [], W = new Map(cs.map(c => [c.id, APP.csysWorld(c.id)]));
+    const nUse = (id) => S.model.bodies.filter(b => b.cs === id).length + cs.filter(c => c.parent === id).length;
+    const pinned = (id) => (S.model.components || []).some(x => x.cs === id) || S.model.exportCs === id;
+    const ang = (A, B) => { let t = 0; for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) t += A[i * 4 + j] * B[i * 4 + j]; return Math.acos(Math.max(-1, Math.min(1, (t - 1) / 2))) * 180 / Math.PI; };
+    const order = cs.slice().sort((a, b) => (pinned(b.id) - pinned(a.id)) || (nUse(b.id) - nUse(a.id)));
+    const reps = [];
+    for (const c of order) {
+      let r = null, best = Infinity;
+      for (const q of reps) { const a = ang(W.get(q.id), W.get(c.id)); if (a <= tolDeg && a < best) { r = q; best = a; } }
+      if (!r) { reps.push(c); continue; }
+      if (pinned(c.id)) { reps.push(c); continue; }
+      const rel = M.mul(M.inv(W.get(r.id)), W.get(c.id)), bs = S.model.bodies.filter(b => b.cs === c.id);
+      if (bs.some(b => b.type === 'RAW' || !CS_TYPES.has(b.type))) continue;
+      let shift = 0; for (const b of bs) shift = Math.max(shift, reexpress(b, rel).shift);
+      if (shift > tolD) continue;
+      out.push({ from: c.id, to: r.id, deg: best, shift, bodies: bs.map(b => b.id), children: cs.filter(x => x.parent === c.id).map(x => x.id) });
+    }
+    return out;
+  };
+  APP.applyCsysMerge = function (p) {
+    const from = APP.getCsys(p.from), to = APP.getCsys(p.to); if (!from || !to) return false;
+    APP.snap();
+    const Wt = APP.csysWorld(to.id), rel = M.mul(M.inv(Wt), APP.csysWorld(from.id));
+    for (const b of S.model.bodies) if (b.cs === from.id) { const r = reexpress(b, rel).body; b.type = r.type; b.p = r.p.map(v => +v.toPrecision(12)); b.cs = to.id; }
+    for (const c of S.model.csys) if (c.parent === from.id) { const w = APP.csysWorld(c.id); c.parent = to.id; c.m = M.mul(M.inv(Wt), w); }
+    if (S.model.active === from.id) S.model.active = to.id;
+    if (!S.model.bodies.some(b => b.cs === from.id) && !S.model.csys.some(x => x.parent === from.id)) S.model.csys = S.model.csys.filter(x => x !== from);
+    APP.changed({ tree: true, right: true });
+    return true;
+  };
+  /** Accepted plane merges (see FK.activeMerges). */
+  APP.addPlaneMerge = function (keep, drop, sign, tolA, tolD) {
+    APP.snap(); (S.model.merges = S.model.merges || []).push({ keep, drop, sign, tolA, tolD }); APP.changed({ tree: true, right: true });
+  };
+  APP.removePlaneMerge = function (i) { if (!S.model.merges || !S.model.merges[i]) return; APP.snap(); S.model.merges.splice(i, 1); APP.changed({ tree: true, right: true }); };
+  APP.setExportCsys = function (id) {
+    id = id || 0; if (id && !APP.getCsys(id)) id = 0;
+    if ((S.model.exportCs || 0) === id) return;
+    APP.snap(); S.model.exportCs = id;
+    APP.changed({ tree: true, right: true });
+    APP.toast(id ? 'The INP is now written in coordinate system ' + APP.csysLabel(id) : 'The INP is now written in the global frame');
+  };
+  APP.toLocal = (p, cs) => { cs = cs === undefined ? S.model.active : cs; return cs ? M.apply(M.inv(APP.csysWorld(cs)), p) : p.slice(); };
+  APP.toWorld = (p, cs) => { cs = cs === undefined ? S.model.active : cs; return cs ? M.apply(APP.csysWorld(cs), p) : p.slice(); };
+  APP.dirToLocal = (v, cs) => { cs = cs === undefined ? S.model.active : cs; return cs ? M.applyVec(M.inv(APP.csysWorld(cs)), v) : v.slice(); };
+  APP.csysLabel = (id) => id ? (APP.getCsys(id) ? APP.getCsys(id).name : '?') : 'Global';
+
+  APP.addCsys = function (m, extra) {
+    extra = extra || {};
+    const c = {
+      id: APP.nid(), name: extra.name || FK.uniqueName('CS1', csysNames()), parent: extra.parent || 0, frozen: !!extra.frozen,
+      m: m || M.id(), visible: extra.visible !== undefined ? extra.visible : true, color: extra.color || '#d9480f'
+    };
+    S.model.csys.push(c);
+    return c;
+  };
+  /** Create from a WORLD matrix; the parent defaults to the active csys. */
+  APP.createCsysWorld = function (mw, extra) {
+    extra = Object.assign({}, extra);
+    if (extra.parent === undefined) extra.parent = S.model.active || 0;
+    const cl = M.clean(mw, 1e-6);
+    if (!cl.ok) { APP.toast(cl.error); return null; }
+    APP.snap();
+    const loc = M.mul(M.inv(APP.csysWorld(extra.parent)), cl.m);
+    const c = APP.addCsys(loc, extra);
+    S.sel = { t: 'csys', id: c.id };
+    APP.changed({ tree: true, right: true });
+    return c;
+  };
+  APP.csysFromPoints = (o, px, pxy) => M.fromAxes(o, V.sub(px, o), V.sub(pxy, o));
+  /* ---------- Definition of a coordinate system: an origin and two axes, each taken from a configurable source (world values) ---------- */
+  APP.csDefNew = function (c) {
+    const w = APP.csysWorld(c.id), P = (p) => ({ src: 'xyz', p: p.slice() });
+    const o = [w[3], w[7], w[11]], xa = [w[0], w[4], w[8]], ya = [w[1], w[5], w[9]];
+    const ax = (axis, v) => ({ axis, src: 'vec', v: v.slice(), flip: false, p1: P(o), p2: P(V.add(o, v)) });
+    return { method: 'axes', o: P(o), a: ax('X', xa), b: ax('Y', ya), px: P(V.add(o, xa)), pxy: P(V.add(o, ya)), error: '', note: '' };
+  };
+  APP.csSlot = (def, path) => path.split('.').reduce((o, k) => o[k], def);
+  /** Axis X / Y / Z (world frame) of coordinate system `id` (0 = global). */
+  APP.csAxisOf = function (id, L) { const w = APP.csysWorld(id || 0), k = 'XYZ'.indexOf(L || 'X'); return [w[k], w[4 + k], w[8 + k]]; };
+  APP.csAxisVec = function (a) { const v = a.src === 'pts' ? V.sub(a.p2.p, a.p1.p) : a.src === 'csax' ? APP.csAxisOf(a.cs, a.cax) : a.v; return a.flip ? V.mul(v, -1) : v.slice(); };
+  const CS_SLOTS = ['o', 'px', 'pxy', 'a.p1', 'a.p2', 'b.p1', 'b.p2'];
+  /** Ids of the coordinate systems a definition takes its origins / axes from. */
+  APP.csRefs = function (def) {
+    const ids = new Set(); if (!def) return ids;
+    for (const pth of CS_SLOTS) { let s = null; try { s = APP.csSlot(def, pth); } catch (e) { s = null; } if (s && s.src === 'cs') ids.add(s.cs | 0); }
+    for (const k of ['a', 'b']) if (def[k] && def[k].src === 'csax') ids.add(def[k].cs | 0);
+    return ids;
+  };
+  /** Points taken from another coordinate system follow that system's current origin. */
+  APP.csRefresh = function (def) {
+    for (const pth of CS_SLOTS) { let s = null; try { s = APP.csSlot(def, pth); } catch (e) { s = null; } if (s && s.src === 'cs') { const w = APP.csysWorld(s.cs | 0); s.p = [w[3], w[7], w[11]]; } }
+  };
+  /** After a coordinate system moved, the systems defined from it are solved again (a few passes: chains). */
+  APP.followCsRefs = function (moved) {
+    const ids = new Set([moved.id]);
+    for (const x of S.model.csys) if (APP.isDescendant(x.id, moved.id)) ids.add(x.id);
+    for (let pass = 0; pass < 4; pass++) {
+      let any = false;
+      for (const d of S.model.csys) {
+        if (!d.def || ids.has(d.id)) continue;
+        const refs = APP.csRefs(d.def); if (![...refs].some(r => ids.has(r))) continue;
+        const r = APP.csDefSolve(d.def); d.def.error = r.error || ''; d.def.note = r.note || ''; if (r.error) continue;
+        const cl = M.clean(M.mul(M.inv(APP.csysWorld(d.parent || 0)), r.world), 1e-4); if (!cl.ok) continue;
+        d.m = cl.m; ids.add(d.id); for (const x of S.model.csys) if (APP.isDescendant(x.id, d.id)) ids.add(x.id); any = true;
+      }
+      if (!any) break;
+    }
+  };
+  /** → { world: 3×4 (world frame) , note } | { error } */
+  APP.csDefSolve = function (def) {
+    APP.csRefresh(def);
+    const o = def.o.p; let ia, ib, va, vb;
+    if (def.method === 'pts3') { ia = 0; ib = 1; va = V.sub(def.px.p, o); vb = V.sub(def.pxy.p, o); }
+    else { ia = 'XYZ'.indexOf(def.a.axis); ib = 'XYZ'.indexOf(def.b.axis); if (ia === ib) return { error: 'Axis 1 and axis 2 must be different (X, Y or Z)' }; va = APP.csAxisVec(def.a); vb = APP.csAxisVec(def.b); }
+    if (!(V.len(va) > 1e-9)) return { error: 'The first axis has zero length' };
+    if (!(V.len(vb) > 1e-9)) return { error: 'The second axis has zero length' };
+    const ua = V.norm(va), vb2 = V.sub(vb, V.mul(ua, V.dot(vb, ua)));
+    if (V.len(vb2) < 1e-6 * V.len(vb)) return { error: 'The two axes are parallel: choose two different directions' };
+    const ub = V.norm(vb2), ic = 3 - ia - ib, s = ((ib - ia + 3) % 3 === 1) ? 1 : -1, uc = V.mul(V.cross(ua, ub), s), E = [null, null, null];
+    E[ia] = ua; E[ib] = ub; E[ic] = uc;
+    const ang = Math.acos(Math.max(-1, Math.min(1, V.dot(ua, V.norm(vb))))) * 180 / Math.PI;
+    return { world: [E[0][0], E[1][0], E[2][0], o[0], E[0][1], E[1][1], E[2][1], o[1], E[0][2], E[1][2], E[2][2], o[2]],
+      note: Math.abs(ang - 90) > 0.01 ? `The 2nd axis is not perpendicular to the 1st (angle ${+ang.toFixed(3)}°): it is projected, the 1st axis is kept exactly` : '' };
+  };
+  APP.applyCsysDef = function (c, key) {
+    const r = APP.csDefSolve(c.def); c.def.error = r.error || ''; c.def.note = r.note || '';
+    if (r.error) { APP.changed({ right: true }); return false; }
+    const loc = M.mul(M.inv(APP.csysWorld(c.parent || 0)), r.world);
+    return APP.setCsysLocal(c, loc, key || null, false, true);
+  };
+  APP.csysFromNormal = function (o, n) {
+    n = V.norm(n);
+    const ref = Math.abs(n[2]) < 0.9 ? [0, 0, 1] : [1, 0, 0];
+    const x = V.norm(V.cross(ref, n));
+    return M.fromAxes(o, x, V.cross(n, x));
+  };
+  APP.renameCsys = function (c, nn) {
+    nn = (nn || '').trim();
+    if (!nn || nn === c.name) return false;
+    if (S.model.csys.some(x => x !== c && x.name === nn)) { APP.toast('A coordinate system with this name already exists'); return false; }
+    APP.snap(); c.name = nn; APP.changed({ tree: true }); return true;
+  };
+  /** Set the local matrix of c; non-frozen descendants follow, frozen ones keep their world pose. */
+  APP.setCsysLocal = function (c, m, key, soft, keepDef) {
+    const cl = M.clean(m, 1e-4);
+    if (!cl.ok) { APP.toast(cl.error); return false; }
+    APP.snap(key);
+    const old = new Map(S.model.csys.map(x => [x.id, APP.csysWorld(x.id)]));
+    c.m = cl.m; if (!keepDef) c.def = null;
+    const order = S.model.csys.filter(x => x !== c && APP.isDescendant(x.id, c.id)).sort((a, b) => APP.csysDepth(a.id) - APP.csysDepth(b.id));
+    for (const x of order) {
+      if (!x.frozen) continue;
+      const loc = M.mul(M.inv(APP.csysWorld(x.parent)), old.get(x.id));
+      x.m = (M.clean(loc, 1e-6).m) || loc;
+    }
+    APP.followCsRefs(c);
+    APP.changed(soft ? { tree: true, csys: true } : { tree: true, right: true });
+    return true;
+  };
+  APP.setCsysWorld = function (c, mw, key, soft) {
+    return APP.setCsysLocal(c, M.mul(M.inv(APP.csysWorld(c.parent)), mw), key, soft);
+  };
+  APP.setCsysFrozen = function (c, v) {
+    APP.snap(); c.frozen = !!v; APP.changed({ tree: true, right: true });
+  };
+  /** Change parent; keep = true keeps the world pose (recomputes the local matrix). */
+  APP.setCsysParent = function (c, pid, keep) {
+    pid = pid || 0;
+    if (pid === c.id || APP.isDescendant(pid, c.id)) { APP.toast('Parent invalide (boucle)'); return false; }
+    APP.snap();
+    const w = APP.csysWorld(c.id);
+    c.parent = pid;
+    if (keep !== false) { const loc = M.mul(M.inv(APP.csysWorld(pid)), w); c.m = M.clean(loc, 1e-6).m || loc; }
+    APP.changed({ tree: true, right: true });
+    return true;
+  };
+  APP.duplicateCsys = function (c) {
+    APP.snap();
+    const d = JSON.parse(JSON.stringify(c)); d.id = APP.nid(); d.name = FK.uniqueName(c.name.replace(/\d+$/, '') + '1', csysNames());
+    S.model.csys.push(d); S.sel = { t: 'csys', id: d.id };
+    APP.changed({ tree: true, right: true }); return d;
+  };
+  APP.setActiveCsys = function (id) {
+    id = id || 0;
+    if (id && !APP.getCsys(id)) id = 0;
+    S.model.active = id;
+    APP.changed({ tree: true, right: true, toolopts: true });
+  };
+  /** Express body b in csys `id`. keep = true: the geometry stays where it is (exact conversion only). */
+  APP.setBodyCsys = function (b, id, keep) {
+    id = id || 0;
+    if (b.cs === id || (!b.cs && !id)) return true;
+    let res = true;
+    APP.snap();
+    if (keep && b.type !== 'RAW') {
+      const rel = M.mul(M.inv(APP.csysWorld(id)), APP.csysWorld(b.cs || 0));
+      const nb = FK.worldBody(JSON.parse(JSON.stringify(b)), rel);
+      if (nb.type === b.type || (FK.isPlaneType(b.type) && nb.type === 'PLA')) { b.type = nb.type; b.p = nb.p.map(x => +x.toFixed(6)); if (b.meta && b.meta.src) delete b.meta.src; }
+      else { res = false; APP.toast('Exact conversion impossible for ' + b.name + ': frame changed, the shape moves'); }
+    }
+    b.cs = id;
+    APP.changed({ tree: true, right: true });
+    return res;
+  };
+  APP.deleteCsys = function (id) {
+    const c = APP.getCsys(id); if (!c) return;
+    APP.snap();
+    const par = c.parent || 0;
+    for (const x of S.model.csys) if (x.parent === id) {
+      const w = APP.csysWorld(x.id);
+      x.parent = par; x.m = M.mul(M.inv(APP.csysWorld(par)), w);
+    }
+    for (const b of S.model.bodies) if (b.cs === id) {
+      b.cs = id; // keep chain valid while converting
+      const rel = M.mul(M.inv(APP.csysWorld(par)), APP.csysWorld(id));
+      const nb = b.type === 'RAW' ? b : FK.worldBody(JSON.parse(JSON.stringify(b)), rel);
+      if (b.type !== 'RAW' && (nb.type === b.type || (FK.isPlaneType(b.type) && nb.type === 'PLA'))) { b.type = nb.type; b.p = nb.p.map(v => +v.toFixed(6)); }
+      b.cs = par;
+    }
+    S.model.csys = S.model.csys.filter(x => x.id !== id);
+    if (S.model.active === id) S.model.active = par;
+    if (S.model.exportCs === id) S.model.exportCs = par;
+    S.sel = null;
+    APP.changed({ tree: true, right: true });
+  };
+
+  /* ---------- Field pickers: fill body parameters from a point / face picked in the 3D view ----------
+   * spec: { kind: 'point'|'vec'|'radius'|'normal', idx:[param indices], comps:[coordinate components], ... } */
+  APP.FIELD_GROUPS = {
+    RPP: [{ l: 'Min corner (xmin, ymin, zmin)', idx: [0, 2, 4], pick: { kind: 'point', idx: [0, 2, 4], comps: [0, 1, 2], next: 1 } },
+      { l: 'Max corner (xmax, ymax, zmax)', idx: [1, 3, 5], pick: { kind: 'point', idx: [1, 3, 5], comps: [0, 1, 2] } }],
+    SPH: [{ l: 'Center', idx: [0, 1, 2], pick: { kind: 'point', idx: [0, 1, 2], comps: [0, 1, 2] } },
+      { l: 'Radius (pick a point on the surface)', idx: [3], pick: { kind: 'radius', idx: 3, center: [0, 1, 2], comps: [0, 1, 2] } }],
+    RCC: [{ l: 'Base center', idx: [0, 1, 2], pick: { kind: 'point', idx: [0, 1, 2], comps: [0, 1, 2], next: 1 } },
+      { l: 'Axis vector (base → top)', idx: [3, 4, 5], pick: { kind: 'vec', idx: [3, 4, 5], base: [0, 1, 2] } },
+      { l: 'Radius (pick a point on the surface)', idx: [6], pick: { kind: 'radius', idx: 6, center: [0, 1, 2], axis: [3, 4, 5] } }],
+    TRC: [{ l: 'Base center', idx: [0, 1, 2], pick: { kind: 'point', idx: [0, 1, 2], comps: [0, 1, 2], next: 1 } },
+      { l: 'Axis vector (base → top)', idx: [3, 4, 5], pick: { kind: 'vec', idx: [3, 4, 5], base: [0, 1, 2] } },
+      { l: 'Base radius', idx: [6], pick: { kind: 'radius', idx: 6, center: [0, 1, 2], axis: [3, 4, 5] } },
+      { l: 'Top radius', idx: [7], pick: { kind: 'radius', idx: 7, center: [0, 1, 2], axis: [3, 4, 5] } }],
+    PLA: [{ l: 'Normal H (pick a face)', idx: [0, 1, 2], pick: { kind: 'normal', idx: [0, 1, 2] } },
+      { l: 'Point V on the plane', idx: [3, 4, 5], pick: { kind: 'point', idx: [3, 4, 5], comps: [0, 1, 2] } }],
+    XYP: [{ l: 'Z position', idx: [0], pick: { kind: 'point', idx: [0], comps: [2] } }],
+    XZP: [{ l: 'Y position', idx: [0], pick: { kind: 'point', idx: [0], comps: [1] } }],
+    YZP: [{ l: 'X position', idx: [0], pick: { kind: 'point', idx: [0], comps: [0] } }],
+    XCC: [{ l: 'Axis position (Y, Z)', idx: [0, 1], pick: { kind: 'point', idx: [0, 1], comps: [1, 2] } }, { l: 'Radius', idx: [2], pick: { kind: 'radius', idx: 2, center: [0, 1], comps: [1, 2] } }],
+    YCC: [{ l: 'Axis position (Z, X)', idx: [0, 1], pick: { kind: 'point', idx: [0, 1], comps: [2, 0] } }, { l: 'Radius', idx: [2], pick: { kind: 'radius', idx: 2, center: [0, 1], comps: [2, 0] } }],
+    ZCC: [{ l: 'Axis position (X, Y)', idx: [0, 1], pick: { kind: 'point', idx: [0, 1], comps: [0, 1] } }, { l: 'Radius', idx: [2], pick: { kind: 'radius', idx: 2, center: [0, 1], comps: [0, 1] } }]
+  };
+  /* Alternative pickers shown next to the main ⌖ of a group: circle centre from an edge / from several points, edge direction, radius from an edge. */
+  (function () {
+    const FG = APP.FIELD_GROUPS;
+    const circ = (idx, comps, axisIdx, radIdx) => [
+      { id: 'cEdge', icon: '◎', title: 'Centre of a circular edge: click the rim', kind: 'circleEdge', idx, comps, axisIdx, radIdx },
+      { id: 'cPts', icon: '∴', title: 'Centre of the circle through several picked points (3 or more)', kind: 'circlePts', idx, comps, axisIdx, radIdx }];
+    const dirA = (idx) => [{ id: 'dEdge', icon: '↗', title: 'Direction of a picked edge (normalized, current length kept)', kind: 'dirEdge', idx }];
+    const radA = (idx) => [{ id: 'rEdge', icon: '◠', title: 'Radius of a picked arc edge (length of a straight edge)', kind: 'radiusEdge', idx }];
+    // axis vector = (centre of the picked circle / rim) − base centre, i.e. the "second point" can use the same techniques as the first
+    const top = (radIdx) => circ([3, 4, 5], [0, 1, 2], null, radIdx).map(a => Object.assign(a, { vecBase: [0, 1, 2], title: a.title.replace('Centre of', 'Top centre = centre of') }));
+    FG.RCC[0].alts = circ([0, 1, 2], [0, 1, 2], [3, 4, 5], 6); FG.RCC[1].alts = dirA([3, 4, 5]).concat(top(6)); FG.RCC[2].alts = radA(6);
+    FG.TRC[0].alts = circ([0, 1, 2], [0, 1, 2], [3, 4, 5], 6); FG.TRC[1].alts = dirA([3, 4, 5]).concat(top(7)); FG.TRC[2].alts = radA(6); FG.TRC[3].alts = radA(7);
+    FG.XCC[0].alts = circ([0, 1], [1, 2], null, 2); FG.XCC[1].alts = radA(2);
+    FG.YCC[0].alts = circ([0, 1], [2, 0], null, 2); FG.YCC[1].alts = radA(2);
+    FG.ZCC[0].alts = circ([0, 1], [0, 1], null, 2); FG.ZCC[1].alts = radA(2);
+  })();
+  /** Negate a vector group (axis vector H → −H). */
+  APP.flipFieldVec = function (b, idx) { APP.snap(); idx.forEach(k => { b.p[k] = +(-b.p[k]).toFixed(6) || 0; }); if (b.meta && b.meta.src) delete b.meta.src; };
+  /** Circle centre (and optionally axis / radius) written into a body; `circle` is in world space. Returns a short description. */
+  APP.applyCirclePick = function (b, spec, circle, extras, only) {
+    const r6 = (x) => +(+x).toFixed(6), cs = b.cs || 0, pl = APP.toLocal(circle.c, cs), notes = [];
+    spec.idx.forEach((k, i) => { if (only === undefined || only === i) b.p[k] = r6(spec.vecBase ? pl[spec.comps[i]] - b.p[spec.vecBase[i]] : pl[spec.comps[i]]); });
+    if (spec.vecBase) notes.push('axis = centre − base');
+    if (extras && only === undefined) {
+      if (spec.axisIdx) {
+        const n = V.norm(APP.dirToLocal(circle.n, cs)), old = spec.axisIdx.map(k => b.p[k]), L = V.len(old) || 1, sg = V.dot(old, n) < 0 ? -1 : 1;
+        spec.axisIdx.forEach((k, i) => { b.p[k] = r6(n[i] * L * sg); }); notes.push('axis along the circle normal');
+      }
+      if (spec.radIdx !== undefined && spec.radIdx !== null) { b.p[spec.radIdx] = r6(circle.r); notes.push('radius = ' + r6(circle.r) + ' cm'); }
+    }
+    if (b.meta && b.meta.src) delete b.meta.src;
+    return notes;
+  };
+  /** data: { p: world point } or { normal: world normal } or { dir: world direction } or { v: number }. The value written is expressed in the body's own coordinate system. */
+  APP.applyFieldPick = function (b, spec, data, only) {
+    const r = (x) => +(+x).toFixed(6), cs = b.cs || 0;
+    const each = (fn) => spec.idx.forEach((k, i) => { if (only === undefined || only === i) fn(k, i); }); // `only`: fill a single coordinate
+    if (spec.kind === 'dir') {
+      // direction of an edge: normalized, then scaled to the current length (1 cm if the vector was null); orientation follows the old vector
+      const d = V.norm(APP.dirToLocal(data.dir, cs)), old = spec.idx.map(k => b.p[k]), L = V.len(old) || 1, sg = V.dot(old, d) < 0 ? -1 : 1;
+      each((k, i) => { b.p[k] = r(d[i] * L * sg); });
+    } else if (spec.kind === 'value') b.p[spec.idx] = r(data.v);
+    else if (spec.kind === 'normal') {
+      const n = V.norm(APP.dirToLocal(data.normal, cs));
+      each((k, i) => { b.p[k] = r(n[i]); });
+    } else {
+      const pl = APP.toLocal(data.p, cs);
+      if (spec.kind === 'point') each((k, i) => { b.p[k] = r(pl[spec.comps[i]]); });
+      else if (spec.kind === 'vec') each((k, i) => { b.p[k] = r(pl[i] - b.p[spec.base[i]]); });
+      else if (spec.kind === 'radius') {
+        let d;
+        if (spec.axis) {
+          const base = spec.center.map(k => b.p[k]), ax = V.norm(spec.axis.map(k => b.p[k])), q = V.sub(pl, base);
+          d = V.len(V.sub(q, V.mul(ax, V.dot(q, ax))));
+        } else d = Math.hypot(...spec.center.map((k, i) => pl[spec.comps[i]] - b.p[k]));
+        b.p[spec.idx] = r(d);
+      } else return false;
+    }
+    if (b.meta && b.meta.src) delete b.meta.src;
+    return true;
+  };
+  /** Place a coordinate system origin (given in world space) — keeps its orientation. */
+  APP.applyCsysPosPick = function (c, pw, only) {
+    const pp = M.apply(M.inv(APP.csysWorld(c.parent)), pw), m = c.m.slice();
+    [3, 7, 11].forEach((k, i) => { if (only === undefined || only === i) m[k] = pp[i]; });
+    return APP.setCsysLocal(c, m);
+  };
+
+  /* ---------- Project (JSON): model + csys + settings ---------- */
+  /* ---- binary helpers: Float32 mesh data <-> (gzip+)base64 ---- */
+  const b64enc = (bytes) => { let s = ''; for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000)); return btoa(s); };
+  const b64dec = (str) => { const s = atob(str), a = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) a[i] = s.charCodeAt(i); return a; };
+  async function packF32(f32) {
+    let bytes = new Uint8Array(f32.buffer, f32.byteOffset, f32.byteLength), enc = 'base64';
+    try {
+      if (typeof CompressionStream !== 'undefined' && typeof Response !== 'undefined') {
+        const out = await new Response(new Blob([bytes]).stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer();
+        bytes = new Uint8Array(out); enc = 'gzip+base64';
+      }
+    } catch (e) { /* uncompressed fallback */ }
+    return { enc, n: f32.length, data: b64enc(bytes) };
+  }
+  async function unpackF32(o) {
+    let bytes = b64dec(o.data);
+    if (o.enc === 'gzip+base64') {
+      if (typeof DecompressionStream === 'undefined') throw new Error('This browser cannot decompress the project (DecompressionStream missing)');
+      bytes = new Uint8Array(await new Response(new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer());
+    }
+    const buf = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+    return new Float32Array(buf);
+  }
+  /** Project = model + coordinate systems + measures + settings + the source meshes (STL / OBJ triangles). */
+  APP.exportProject = async function (withMeshes) {
+    const stls = [];
+    if (withMeshes !== false) for (const m of S.stls) stls.push({ id: m.id, name: m.name, format: m.format || 'STL', unit: m.unit, offset: m.offset, flip: !!m.flip, visible: m.visible, opacity: m.opacity, color: m.color, edges: m.edges, grp: m.grp || 0, steps: m.steps || [], mesh: await packF32(m.raw) });
+    return JSON.stringify({ app: 'fluka-geo-tool', kind: 'project', version: 4, model: S.model, measures: S.measures, nextId: S.nextId, filter: S.filter, stls });
+  };
+  /* ---------- Configuration file (settings only, no geometry) ---------- */
+  const OPT0 = JSON.parse(JSON.stringify(S.opt));
+  APP.CONFIG_KEYS = ['theme', 'axes', 'multiPick', 'invX', 'invY', 'margin', 'zoomCursor', 'numStep', 'showInpName', 'exprText', 'res', 'render', 'edges', 'colorBy', 'maxParen', 'maxZones', 'inpZones', 'inpComments', 'inpNoNeg', 'checksFold', 'showParts', 'zonesPerLine', 'names', 'proj', 'lw', 'rw', 'dw', 'sheetH',
+    'snapOn', 'snap', 'snapTol', 'snapAng', 'snapFeat', 'coplanar', 'coTol', 'sharp', 'edgeSoft', 'edgeSharpOnly', 'circleAll', 'ptMode', 'pieceHl', 'keepPos',
+    'cutKeep', 'cutZone', 'cutStay', 'cutMergeAng', 'cutMergeTol', 'style', 'inpFull', 'inpTransform', 'inpComment', 'inpRen', 'scale', 'scaleOpen', 'secClosed'];
+  /** Settings (and the list of materials) as a JSON text: the project file holds the geometry only. */
+  APP.exportConfig = function () {
+    const settings = {};
+    for (const k of APP.CONFIG_KEYS) if (S.opt[k] !== undefined) settings[k] = JSON.parse(JSON.stringify(S.opt[k]));
+    return JSON.stringify({ app: 'fluka-geo-tool', kind: 'config', version: 1, settings, materials: (S.model.materials || []).map(m => m.name) }, null, 1);
+  };
+  /** Applies a configuration file: only known keys of the same type are taken; missing materials are added. Returns { n, materials } or { error }. */
+  APP.importConfig = function (text) {
+    let o; try { o = JSON.parse(text); } catch (e) { return { error: 'Invalid JSON' }; }
+    if (!o || o.app !== 'fluka-geo-tool' || o.kind !== 'config' || !o.settings || typeof o.settings !== 'object') return { error: 'Not a configuration file (a project file holds geometry: use File ▸ Open project)' };
+    APP.snap(); let n = 0;
+    for (const k of APP.CONFIG_KEYS) {
+      if (!(k in o.settings)) continue;
+      const v = o.settings[k], ref = OPT0[k] !== undefined ? OPT0[k] : S.opt[k];
+      if (ref !== undefined && ref !== null && typeof ref !== typeof v) continue;
+      if (typeof v === 'number' && !isFinite(v)) continue;
+      S.opt[k] = JSON.parse(JSON.stringify(v)); n++;
+    }
+    let mats = 0;
+    if (Array.isArray(o.materials)) { S.model.materials = S.model.materials || FK.defaultMaterials(); for (const nm of o.materials) { const c = FK.cleanMaterialName(nm); if (c && !S.model.materials.some(m => m.name === c)) { APP.materialByName(c, true); mats++; } } }
+    return { n, materials: mats };
+  };
+  /** Back to the default settings (the geometry is untouched). */
+  APP.resetConfig = function () { for (const k of APP.CONFIG_KEYS) { if (OPT0[k] !== undefined) S.opt[k] = JSON.parse(JSON.stringify(OPT0[k])); else delete S.opt[k]; } };
+  /** Gives a valid name (see FK.cleanObjectName) to the bodies and regions of older projects; the expressions follow. Returns the number renamed. */
+  APP.sanitizeNames = function () {
+    let n = 0;
+    const run = (list, isBody) => {
+      const used = new Set(list.map(x => x.name));
+      for (const it of list) {
+        if (FK.validObjectName(it.name)) continue;
+        const old = it.name; let c = FK.cleanObjectName(old) || (isBody ? 'body' : 'reg'), cand = c;
+        for (let k = 2; used.has(cand); k++) cand = c + '_' + k;
+        used.delete(old); used.add(cand); it.name = cand; n++;
+        if (isBody) for (const r of S.model.regions) if (r.expr && r.expr.includes(old)) r.expr = r.expr.split(old).join(cand);
+      }
+    };
+    run(S.model.bodies, true); run(S.model.regions, false);
+    return n;
+  };
+  APP.importProject = async function (text) {
+    S.checksOff = false;
+    let o; try { o = JSON.parse(text); } catch (e) { APP.toast('Invalid JSON'); return false; }
+    if (!o || !o.model || !Array.isArray(o.model.bodies)) { APP.toast('Not a project file'); return false; }
+    const stls = [];
+    try {
+      for (const m of (o.stls || [])) {
+        stls.push({ id: m.id, name: m.name, format: m.format || 'STL', raw: await unpackF32(m.mesh), unit: m.unit || 'mm', offset: m.offset || [0, 0, 0], flip: !!m.flip, visible: m.visible !== false, opacity: m.opacity === undefined ? 0.6 : m.opacity, color: m.color || '#8f9bb0', edges: !!m.edges, grp: m.grp || 0, steps: APP.cleanSteps(m.steps), group: null, mesh: null });
+      }
+    } catch (e) { APP.toast('Mesh data unreadable: ' + e.message); return false; }
+    APP.snap();
+    for (const m of S.stls) if (APP.hooks.disposeStl) APP.hooks.disposeStl(m);
+    S.stls = stls; for (const m of stls) APP.buildStl(m);
+    S.model = o.model; S.model.tail = S.model.tail || []; S.model.regions = S.model.regions || []; S.model.csys = S.model.csys || []; S.model.active = S.model.active || 0; S.model.groups = S.model.groups || []; S.model.components = S.model.components || []; S.model.materials = S.model.materials || FK.defaultMaterials();
+    S.measures = o.measures || [];
+    // the settings (tolerances, mouse rotation…) live in the configuration file: older projects that carried them are not allowed to overwrite the current ones
+    if (o.filter) S.filter = o.filter;
+    let mx = o.nextId || 1000; for (const a of [S.model.bodies, S.model.regions, S.model.csys, S.measures, S.stls]) for (const x of a) mx = Math.max(mx, (x.id || 0) + 1);
+    S.nextId = Math.max(S.nextId, mx); S.sel = null; S.pick = null; S.fill = null;
+    { const nn = APP.sanitizeNames(); if (nn) APP.toast(`${nn} object name${nn > 1 ? 's' : ''} contained spaces or special characters: replaced by _`); }
+    APP.changed({ tree: true, right: true, measures: true, fit: true });
+    return true;
+  };
+
+  /* ---------- Names ---------- */
+  const bodyNames = () => new Set(S.model.bodies.map(b => b.name));
+  const regionNames = () => new Set(S.model.regions.map(r => r.name));
+  APP.bodyNames = bodyNames;
+
+  /* ---------- Creating bodies / regions ---------- */
+  APP.defaultParams = function (type) {
+    const W = S.W || { min: [-50, -50, -50], max: [50, 50, 50] };
+    const c = APP.toLocal(FK.boxCenter(W)), d = Math.max(FK.boxDiag(W), 10);
+    const h = d / 10, r = (x) => +x.toFixed(3);
+    switch (type) {
+      case 'RPP': return [c[0] - h, c[0] + h, c[1] - h, c[1] + h, c[2] - h, c[2] + h].map(r);
+      case 'SPH': return [c[0], c[1], c[2], h].map(r);
+      case 'RCC': return [c[0], c[1], c[2] - h, 0, 0, 2 * h, h / 2].map(r);
+      case 'TRC': return [c[0], c[1], c[2] - h, 0, 0, 2 * h, h / 2, h / 4].map(r);
+      case 'PLA': return [0, 0, 1, c[0], c[1], c[2]].map(r);
+      case 'XYP': return [r(c[2])]; case 'XZP': return [r(c[1])]; case 'YZP': return [r(c[0])];
+      case 'XCC': return [c[1], c[2], h].map(r);
+      case 'YCC': return [c[2], c[0], h].map(r);
+      case 'ZCC': return [c[0], c[1], h].map(r);
+    }
+    return [];
+  };
+
+  APP.addBody = function (type, p, extra) {
+    extra = extra || {};
+    const info = FK.BODY_TYPES[type];
+    const name = (extra.name && FK.cleanObjectName(extra.name)) || FK.uniqueName(info.prefix + '1', bodyNames());
+    const b = {
+      id: APP.nid(), type, name, p: p || APP.defaultParams(type), cs: extra.cs !== undefined ? extra.cs : (S.model.active || 0),
+      visible: extra.visible !== undefined ? extra.visible : true,
+      opacity: extra.opacity !== undefined ? extra.opacity : (FK.isPlaneType(type) ? 0.25 : 0.3),
+      color: extra.color || color(S.model.bodies.length), meta: extra.meta || {}
+    };
+    S.model.bodies.push(b);
+    return b;
+  };
+  APP.addRegion = function (name, expr, extra) {
+    extra = extra || {};
+    const r = {
+      id: APP.nid(), name: (name && FK.cleanObjectName(name)) || FK.uniqueName('reg1', regionNames()), nvois: extra.nvois || 5, expr: expr || '',
+      visible: extra.visible !== undefined ? extra.visible : false, opacity: extra.opacity !== undefined ? extra.opacity : 0.4,
+      color: extra.color || color(S.model.regions.length + 3), meta: {}
+    };
+    S.model.regions.push(r);
+    return r;
+  };
+  /* ---------- Void region around a region (experimental) ---------- */
+  // Plan: bounding box of the evaluated region + margin, names, and the complement expression.
+  APP.voidPlan = function (r, margin, mode) {
+    const ev = APP.evalRegionNow(r);
+    if (ev.error) return { error: 'Cannot evaluate "' + r.name + '": ' + ev.error };
+    if (!ev.bbox || ev.vol < 1e-9) return { error: 'Region "' + r.name + '" is empty inside the render zone, so there is nothing to surround.', diag: ev.diag };
+    margin = Math.max(0, +margin || 0);
+    const r3 = (x) => +x.toFixed(4);
+    // the box is defined in the default (active) coordinate system, like any new body: bounding box of the region in that frame
+    const cs = S.model.active || 0; let bb = ev.bbox;
+    if (cs && ev.polys && ev.polys.length) {
+      const inv = M.inv(APP.csysWorld(cs)), lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+      for (const pg of ev.polys) for (const v of pg.v) { const q = M.apply(inv, [v[0], v[1], v[2]]); for (let k = 0; k < 3; k++) { if (q[k] < lo[k]) lo[k] = q[k]; if (q[k] > hi[k]) hi[k] = q[k]; } }
+      bb = { min: lo, max: hi };
+    }
+    const mn = bb.min.map(x => r3(x - margin)), mx = bb.max.map(x => r3(x + margin));
+    const p = [mn[0], mx[0], mn[1], mx[1], mn[2], mx[2]];
+    const boxName = FK.uniqueName('vb_' + r.name, bodyNames());
+    const regName = FK.uniqueName('v_' + r.name, regionNames());
+    let expr;
+    try { expr = FK.complementExpr(r.expr, boxName, mode || 'compact'); } catch (e) { return { error: e.message }; }
+    return { p, cs, boxName, regName, expr, bbox: ev.bbox, margin, mode: mode || 'compact', vol: ev.vol };
+  };
+  APP.createVoidRegion = function (r, margin, mode) {
+    const pl = APP.voidPlan(r, margin, mode);
+    if (pl.error) return pl;
+    APP.snap();
+    const body = APP.addBody('RPP', pl.p, { name: pl.boxName, cs: pl.cs, visible: false, color: '#9aa0a6', meta: { voidOf: r.name } });
+    const reg = APP.addRegion(pl.regName, pl.expr, { visible: false, nvois: r.nvois });
+    reg.meta = { voidOf: r.name };
+    { const bh = APP.materialByName('BLCKHOLE'); if (bh) reg.mat = bh.id; }
+    S.sel = { t: 'region', id: reg.id };
+    APP.changed({ tree: true, right: true });
+    APP.toast(`Void region ${reg.name} created with RPP ${body.name} (hidden; show it from the tree)`);
+    return { body, region: reg, plan: pl };
+  };
+  /* ---------- Boolean of two regions, written with their bodies only (experimental) ---------- */
+  const BOOL_SYM = { sub: 'm', int: 'i', union: 'u' };
+  APP.boolPlan = function (a, b, op, mode) {
+    if (!a || !b) return { error: 'Choose the second region.' };
+    mode = mode || 'compact'; op = op || 'sub';
+    let expr;
+    try { expr = FK.combineExpr(a.expr, b.expr, op, mode); } catch (e) { return { error: e.message }; }
+    const regName = FK.uniqueName(BOOL_SYM[op] + '_' + a.name, regionNames());
+    const ev = APP.evalRegionNow({ expr }), ea = APP.evalRegionNow(a), eb = APP.evalRegionNow(b);
+    return { expr, regName, op, mode, vol: ev.error ? null : ev.vol, volA: ea.error ? null : ea.vol, volB: eb.error ? null : eb.vol, error2: ev.error || null };
+  };
+  /* ---------- New region from 6 planes (picked one by one; the signs are worked out) ---------- */
+  APP.reg6Begin = function () {
+    APP.snap(); const r = APP.addRegion(APP.regionNameFor('box'), '', { visible: true });
+    S.reg6 = { rid: r.id, names: [] }; S.sel = { t: 'region', id: r.id }; APP.changed({ tree: true, right: true }); return r;
+  };
+  APP.reg6Cancel = function (removeRegion) {
+    const st = S.reg6; S.reg6 = null;
+    if (st && removeRegion) { const r = APP.getRegion(st.rid); if (r && !r.expr) { S.model.regions.splice(S.model.regions.indexOf(r), 1); S.sel = null; } }
+    APP.changed({ tree: true, right: true });
+  };
+  APP.reg6Undo = function () { if (S.reg6 && S.reg6.names.length) { S.reg6.names.pop(); APP.changed({ right: true }); } };
+  /** Adds a plane (body name) to the pending region; with the sixth, writes the formula. Returns { done, error, expr }. */
+  APP.reg6Add = function (name) {
+    const st = S.reg6; if (!st) return { error: 'No region is waiting for planes' };
+    const b = APP.getBodyByName ? APP.getBodyByName(name) : S.model.bodies.find(x => x.name === name);
+    if (!b || !FK.isPlaneType(b.type)) return { error: 'Only planes can be used here' };
+    if (st.names.includes(b.name)) return { error: b.name + ' is already in the list' };
+    st.names.push(b.name);
+    if (st.names.length < 6) return { done: false, count: st.names.length };
+    const r = APP.getRegion(st.rid); if (!r) { S.reg6 = null; return { error: 'The region no longer exists' }; }
+    const pls = st.names.map(nm => { const pl = FK.planeOf(APP.wbody(S.model.bodies.find(x => x.name === nm))), L = V.len(pl.H); const n = V.mul(pl.H, 1 / L); return { n, d: V.dot(n, pl.V) }; });
+    const cell = FK.cellFromPlanes(pls);
+    if (cell.error) { st.names.pop(); return { error: cell.error }; }
+    r.expr = st.names.map((nm, i) => (cell.signs[i] < 0 ? '-' : '+') + nm).join(' ');
+    S.reg6 = null; S.sel = { t: 'region', id: r.id }; APP.changed({ tree: true, right: true });
+    return { done: true, expr: r.expr, alternatives: cell.alternatives, region: r };
+  };
+  /* ---------- Complexity of region formulas: simplify, flatten, split ---------- */
+  /** Deepest nesting of parentheses accepted before a warning (setting; 99 = no limit). */
+  APP.maxParen = () => { const v = S.opt.maxParen; return v === undefined || v === null || v === '' || isNaN(+v) ? 1 : +v; };
+  /** Most zones (parts separated by |) recommended for one region (setting; 0 = no limit). */
+  /** File name (no extension) taken from the project title: the extensions of project files (.fgt, .json) and spaces are dropped. */
+  APP.fileBase = () => (String(S.model.title || 'geometry').replace(/\.(fgt\.)?json$/i, '').replace(/\.fgt$/i, '').replace(/[^\w\-]+/g, '_').replace(/^_+|_+$/g, '')) || 'geometry';
+  APP.maxZones = () => { const v = S.opt.maxZones; return v === undefined || v === null || v === '' || isNaN(+v) ? 10 : +v; };
+  APP.regionStats = (r) => FK.exprStats(r.expr || '');
+  /** Same region, shorter formula (redundant terms / zones removed, useless parentheses opened). Returns { before, after } or { error }. */
+  APP.simplifyRegion = function (r) {
+    if (r.meta && r.meta.link) return { error: 'This region follows a combination: change the combination instead.' };
+    let e; try { e = FK.simplifyExpr(r.expr); } catch (err) { return { error: err.message }; }
+    if (e === r.expr) return { before: r.expr, after: e, same: true };
+    APP.snap(); const before = r.expr; r.expr = e; return { before, after: e };
+  };
+  /** Formula without any parenthesis (union of zones). A combination keeps following its regions, written in the flat form. */
+  APP.flattenRegion = function (r) {
+    const lk = r.meta && r.meta.link;
+    if (lk) { APP.snap(); lk.mode = 'flat'; APP.syncLinks(); return lk.error ? { error: lk.error } : { after: r.expr }; }
+    let f; try { f = FK.flattenExpr(r.expr); } catch (err) { return { error: err.message }; }
+    if (f.expr === r.expr) return { after: f.expr, same: true };
+    APP.snap(); r.expr = f.zones > 1 ? FK.zoneLines(f.expr) : f.expr; return { after: f.expr, zones: f.zones };
+  };
+  /** What "split" would give: the disjoint zones as parenthesis-free formulas, with the names of the regions. */
+  APP.splitPlan = function (r, per) {
+    let list; try { list = FK.splitExpr(r.expr, per === undefined ? APP.maxZones() : per); } catch (err) { return { error: err.message }; }
+    const taken = regionNames(), names = [r.name];
+    for (let k = 1; k < list.length; k++) { const n = FK.uniqueName(r.name + '_' + (k + 1), taken); taken.add(n); names.push(n); }
+    return { list, names };
+  };
+  /** Replaces the region by several regions with disjoint, parenthesis-free formulas (same material, group, colour…). Returns { regions } or { error }. */
+  APP.splitRegion = function (r, per) {
+    const pl = APP.splitPlan(r, per); if (pl.error) return pl;
+    APP.snap();
+    if (r.meta && r.meta.link) delete r.meta.link;           // the formula is cut into pieces: it no longer follows a combination
+    r.expr = pl.list[0];
+    const out = [r], at = S.model.regions.indexOf(r);
+    for (let k = 1; k < pl.list.length; k++) {
+      const c = JSON.parse(JSON.stringify(r)); c.id = APP.nid(); c.name = pl.names[k]; c.expr = pl.list[k]; if (c.meta) delete c.meta.link;
+      S.model.regions.splice(at + k, 0, c); out.push(c);
+    }
+    return { regions: out };
+  };
+  /** What it takes to bring every exported region within the limits (parentheses depth, zones per region, no negated union):
+   *  flat = rewritten as zones; split = cut into several regions of at most maxZones zones (no overlap); fail = too large to expand. */
+  APP.complexPlan = function () {
+    const lim = APP.maxParen(), zl = APP.maxZones(), out = { flat: [], split: [], fail: [] };
+    for (const r of S.model.regions) {
+      if (r.noExport || r.auto || APP.regionChildren(r).length) continue;
+      const st = APP.regionStats(r); let neg = false;
+      try { neg = FK.hasNegUnion(r.expr); } catch (e) { neg = false; }
+      if (!(st.depth > lim || (zl && st.zones > zl) || neg)) continue;
+      let f; try { f = FK.flattenExpr(r.expr); } catch (e) { out.fail.push(r); continue; }
+      if (!zl || f.zones <= zl) { if (st.depth > lim || neg) out.flat.push(r); }
+      else { const pl = APP.splitPlan(r, zl); if (pl.error) out.fail.push(r); else out.split.push({ r, n: pl.list.length }); }
+    }
+    return out;
+  };
+  /** Applies complexPlan: flattens, and splits the regions that stay too long. Returns { flat, split, added, failed }. */
+  APP.fixComplex = function () {
+    const pl = APP.complexPlan(); if (!pl.flat.length && !pl.split.length) return { flat: 0, split: 0, added: 0, failed: pl.fail.map(r => r.name) };
+    APP.snap(); let flat = 0, added = 0;
+    for (const r of pl.flat) {
+      const lk = r.meta && r.meta.link;
+      if (lk) { lk.mode = 'flat'; APP.syncLinks(); if (!lk.error) flat++; } else { try { const f = FK.flattenExpr(r.expr); r.expr = f.zones > 1 ? FK.zoneLines(f.expr) : f.expr; flat++; } catch (e) { /* kept */ } }
+    }
+    for (const x of pl.split) { const res = APP.splitRegion(x.r, APP.maxZones()); if (!res.error) added += res.regions.length - 1; }
+    return { flat, split: pl.split.length, added, failed: pl.fail.map(r => r.name) };
+  };
+  /** Flattens every exported region nested deeper than the limit. Returns { done, failed: [names] }. */
+  APP.flattenAllComplex = function () {
+    const lim = APP.maxParen(), todo = S.model.regions.filter(r => !r.noExport && !r.auto && APP.regionStats(r).depth > lim);
+    if (!todo.length) return { done: 0, failed: [] };
+    APP.snap(); const failed = []; let done = 0;
+    for (const r of todo) {
+      const lk = r.meta && r.meta.link; let ok = true;
+      if (lk) { lk.mode = 'flat'; APP.syncLinks(); ok = !lk.error; }
+      else { try { r.expr = FK.flattenExpr(r.expr).expr; } catch (e) { ok = false; } }
+      if (ok) done++; else failed.push(r.name);
+    }
+    return { done, failed };
+  };
+  /** Toast summarising the quality check of a freshly created region (the full text is in its properties). */
+  APP.reportQuality = function (reg) {
+    const ev = APP.evalRegionNow(reg);
+    if (ev.error || !ev.quality || !ev.quality.length) return ev;
+    APP.toast(`⚠ ${reg.name}: ${ev.quality[0].text}` + (ev.quality.length > 1 ? ` (+${ev.quality.length - 1})` : ''));
+    return ev;
+  };
+  /** Operations of a live link, in order: the first is { op, id: b }, the following ones are in link.more. Result = ((A op1 B1) op2 B2) op3 B3 … */
+  APP.linkOps = (l) => [{ op: l.op, id: l.b }].concat(l.more || []);
+  APP.linkIds = (l) => [l.a].concat(APP.linkOps(l).map(x => x.id));
+  /** Regions that (directly or through other links) are computed from region `id`. */
+  APP.linkDependents = function (id) {
+    const out = new Set(), todo = [id];
+    while (todo.length) { const cur = todo.pop(); for (const x of S.model.regions) if (x.meta && x.meta.link && !out.has(x.id) && APP.linkIds(x.meta.link).includes(cur)) { out.add(x.id); todo.push(x.id); } }
+    return out;
+  };
+  /** Strong (live) links: region.meta.link = { a, b, op, more: [{ op, id }], mode } (region ids). The expression is recomputed whenever the parents change. */
+  /* ---------- Nested regions: a region placed "inside" another one is cut out of it when the INP is written ---------- */
+  /** Union of formulas (zones concatenated); regions whose formula does not parse are ignored. */
+  APP.unionExprs = function (list) {
+    const zones = []; for (const r of list) { try { zones.push(...FK.parseExpr(r.expr).zones); } catch (e) { /* invalid formula: ignored */ } }
+    return zones.length ? FK.formatExpr({ zones }) : '';
+  };
+  APP.regionParent = (r) => r.parent ? S.model.regions.find(x => x.id === r.parent && x !== r) || null : null;
+  /** Exported sub-regions of r (direct children). */
+  APP.regionChildren = (r, all) => S.model.regions.filter(x => x.parent === r.id && x !== r && (all || !x.noExport) && x.expr && x.expr.trim());
+  /** Formula written in the INP: the region minus the union of its sub-regions (the user's definition stays the simple outer volume). */
+  const effCache = new Map();
+  APP.effExpr = function (r) {
+    const kids = r.noExport ? [] : APP.regionChildren(r); if (!kids.length) return r.expr;
+    const U = APP.unionExprs(kids); if (!U) return r.expr;
+    const key = r.expr + '\u0001' + U, hit = effCache.get(key); if (hit !== undefined) return hit;
+    let e; try { e = FK.combineExpr(r.expr, U, 'sub', 'compact'); } catch (err) { e = r.expr; }
+    if (effCache.size > 400) effCache.clear(); effCache.set(key, e); return e;
+  };
+  /** Model as written in the INP file: same objects, the formulas of the regions that have sub-regions replaced. */
+  APP.expModel = function () {
+    const m = S.model; if (!m.regions.some(r => r.parent)) return m;
+    return Object.assign({}, m, { regions: m.regions.map(r => APP.regionChildren(r).length ? Object.assign({}, r, { expr: APP.effExpr(r) }) : r) });
+  };
+  /** Regions that can become the parent of r (not itself, not one of its descendants, not automatic). */
+  APP.parentChoices = function (r) {
+    const bad = new Set([r.id]); let grow = true;
+    while (grow) { grow = false; for (const x of S.model.regions) if (!bad.has(x.id) && bad.has(x.parent)) { bad.add(x.id); grow = true; } }
+    return S.model.regions.filter(x => !bad.has(x.id) && !x.auto);
+  };
+  APP.setRegionParent = function (r, pid) {
+    pid = +pid || 0; if (pid && !APP.parentChoices(r).some(x => x.id === pid)) return false;
+    APP.snap(); if (pid) r.parent = pid; else delete r.parent; APP.changed({ tree: true, right: true }); return true;
+  };
+  /** GLOBAL: regions added by hand to its definition. */
+  APP.globalAdd = () => { const c = S.model.autoCfg || {}; return (c.globalAdd || []).map(id => S.model.regions.find(r => r.id === id)).filter(r => r && !r.auto); };
+  APP.setGlobalAdd = function (id, on) {
+    S.model.autoCfg = S.model.autoCfg || {}; const a = new Set(S.model.autoCfg.globalAdd || []);
+    if (on) a.add(+id); else a.delete(+id); S.model.autoCfg.globalAdd = [...a]; APP.syncAuto(); APP.changed({ tree: true, right: true });
+  };
+  /* ---------- Automatic regions: GLOBAL (union of the real components), AIR (box around it), BLCKBODY (box around AIR) ---------- */
+  // The formulas and the boxes are recomputed from the model at every change, so renaming, adding or removing objects is followed.
+  // r.auto = 'global' | 'air' | 'bb' ; b.auto = 'air' | 'bb' ; margins in S.model.autoCfg = { air, bb } (cm).
+  APP.AUTO = { names: { global: 'GLOBAL', air: 'AIR', bb: 'BLCKBODY' }, boxes: { air: 'AIRBOX', bb: 'BBBOX' }, mats: { global: '', air: 'AIR', bb: 'BLCKHOLE' }, EXCL: ['AIR', 'BLCKHOLE', 'BLCKBODY', 'VACUUM'], DEF_MARGIN: 50 };
+  APP.autoRegion = (k) => S.model.regions.find(r => r.auto === k) || null;
+  APP.autoBody = (k) => S.model.bodies.find(b => b.auto === k) || null;
+  APP.hasAuto = () => S.model.regions.some(r => r.auto);
+  APP.autoMargin = (k) => { const c = S.model.autoCfg || {}; const v = c[k]; return isFinite(v) && v >= 0 ? +v : APP.AUTO.DEF_MARGIN; };
+  const autoFb = new Map();                                   // bounding boxes obtained by evaluation (regions made of planes): cache
+  const autoBoxOf = function (ast) {                          // upper bound of an expression, in the export frame; null = unbounded / unknown
+    const un = (a, b) => !a ? b : { min: a.min.map((x, i) => Math.min(x, b.min[i])), max: a.max.map((x, i) => Math.max(x, b.max[i])) };
+    const it = (a, b) => !a ? b : { min: a.min.map((x, i) => Math.max(x, b.min[i])), max: a.max.map((x, i) => Math.min(x, b.max[i])) };
+    let out = null;
+    for (const z of ast.zones) {
+      let bx = null;
+      for (const t of z) {
+        if (t.sign < 0) continue;
+        let tb = null;
+        if (t.name) { const b = S.model.bodies.find(x => x.name === t.name); if (b) { try { tb = FK.bodyBBox(APP.xbody(b)); } catch (e) { tb = null; } } }
+        else if (t.sub) tb = autoBoxOf(t.sub);
+        if (tb) bx = it(bx, tb);
+      }
+      if (!bx) return null;
+      out = un(out, bx);
+    }
+    return out;
+  };
+  const autoRegionBox = function (r) {
+    let ast; try { ast = FK.parseExpr(r.expr || ''); } catch (e) { return null; }
+    const bx = autoBoxOf(ast); if (bx) return bx;
+    const key = r.expr + '|' + JSON.stringify([S.model.bodies.map(b => [b.name, b.type, b.p, b.cs]), S.model.csys, S.model.exportCs]);
+    if (autoFb.has(key)) return autoFb.get(key);
+    let res = null;
+    try {
+      const ev = APP.evalRegionNow(r);
+      if (!ev.error && ev.bbox) {
+        const ex = APP.exportCs(), inv = ex ? M.inv(APP.csysWorld(ex)) : null, lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+        for (let c = 0; c < 8; c++) {
+          let q = [c & 1 ? ev.bbox.max[0] : ev.bbox.min[0], c & 2 ? ev.bbox.max[1] : ev.bbox.min[1], c & 4 ? ev.bbox.max[2] : ev.bbox.min[2]];
+          if (inv) q = M.apply(inv, q);
+          for (let k = 0; k < 3; k++) { lo[k] = Math.min(lo[k], q[k]); hi[k] = Math.max(hi[k], q[k]); }
+        }
+        res = { min: lo, max: hi };
+      }
+    } catch (e) { res = null; }
+    if (autoFb.size > 50) autoFb.clear(); autoFb.set(key, res); return res;
+  };
+  /** Recomputes the three regions and their two boxes. Returns true when something changed. */
+  APP.syncAuto = function () {
+    const m = S.model; if (!m || !m.regions || !m.regions.some(r => r.auto)) return false;
+    const A = APP.AUTO, rg = APP.autoRegion('global'), ra = APP.autoRegion('air'), rb = APP.autoRegion('bb'), ba = APP.autoBody('air'), bb = APP.autoBody('bb');
+    const matOf = (r) => { const mt = r.mat ? APP.getMaterial(r.mat) : null; return mt ? mt.name.toUpperCase() : ''; };
+    const real0 = m.regions.filter(r => !r.auto && !r.noExport && r.expr && r.expr.trim());
+    const inSet = (set) => (r) => !(r.parent && set.has(r.parent));         // a sub-region lies inside its parent: the parent's formula already covers it
+    const real = real0.filter(inSet(new Set(real0.map(r => r.id))));
+    const added = APP.globalAdd().filter(r => r.expr && r.expr.trim());
+    const coreAuto = real0.filter(r => !A.EXCL.includes(matOf(r)));
+    const coreAll = coreAuto.concat(added.filter(r => !coreAuto.includes(r)));
+    const core = coreAll.filter(inSet(new Set(coreAll.map(r => r.id))));
+    const unionOf = (list) => { const zones = []; for (const r of list) { try { zones.push(...FK.parseExpr(r.expr).zones); } catch (e) { /* invalid formula: ignored */ } } return zones.length ? FK.formatExpr({ zones }) : ''; };
+    let ch = false;
+    const setProp = (o, k, v) => { if (JSON.stringify(o[k]) !== JSON.stringify(v)) { o[k] = v; ch = true; } };
+    // formulas
+    const U = unionOf(core), Uall = unionOf(real);
+    if (rg) setProp(rg, 'expr', U);
+    if (ra && ba) { let e = '+' + ba.name; if (Uall) { try { e = FK.complementExpr(Uall, ba.name, 'compact'); } catch (err) { e = '+' + ba.name; } } setProp(ra, 'expr', e); }
+    if (rb && bb && ba) setProp(rb, 'expr', '+' + bb.name + ' -' + ba.name);
+    { const xa = !!((ra && !ra.noExport) || (rb && !rb.noExport)), xb = !!(rb && !rb.noExport);
+      if (ba && !!ba.noExport !== !xa) { if (xa) delete ba.noExport; else ba.noExport = true; ch = true; }
+      if (bb && !!bb.noExport !== !xb) { if (xb) delete bb.noExport; else bb.noExport = true; ch = true; } }
+    // boxes around the union of the real components (all of them, so that nothing is left outside AIR)
+    let box = null;
+    for (const r of core) { const x = autoRegionBox(r); if (x) box = !box ? x : { min: box.min.map((v, i) => Math.min(v, x.min[i])), max: box.max.map((v, i) => Math.max(v, x.max[i])) }; }
+    if (box && ba) {
+      const g = APP.autoMargin('air'), h = g + APP.autoMargin('bb'), lo = (v) => Math.floor(v * 1e4) / 1e4, hi = (v) => Math.ceil(v * 1e4) / 1e4;
+      const mk = (d) => [lo(box.min[0] - d), hi(box.max[0] + d), lo(box.min[1] - d), hi(box.max[1] + d), lo(box.min[2] - d), hi(box.max[2] + d)];
+      const ex = APP.exportCs();
+      setProp(ba, 'p', mk(g)); setProp(ba, 'cs', ex); if (bb) { setProp(bb, 'p', mk(h)); setProp(bb, 'cs', ex); }
+    }
+    return ch;
+  };
+  /** Explicit refresh (command): drops the cached boxes and recomputes formulas and boxes. Returns { changed } or { error }. */
+  APP.updateAuto = function () {
+    if (!APP.hasAuto()) return { error: 'No automatic regions yet: create them first' };
+    APP.snap(); autoFb.clear(); const ch = APP.syncAuto();
+    APP.changed({ tree: true, right: true }); return { changed: ch };
+  };
+  /** Creates (or completes) the three regions and the two boxes. */
+  APP.createAutoRegions = function () {
+    if (APP.hasAuto()) return { error: 'The automatic regions already exist' };
+    APP.snap();
+    const A = APP.AUTO, cs = APP.exportCs(); S.model.autoCfg = S.model.autoCfg || { air: A.DEF_MARGIN, bb: A.DEF_MARGIN };
+    const bn = new Set(S.model.bodies.map(b => b.name)), rn = new Set(S.model.regions.map(r => r.name));
+    const mkBody = (k) => { const b = APP.addBody('RPP', [0, 1, 0, 1, 0, 1], { name: FK.uniqueName(A.boxes[k], bn), cs, visible: false, color: k === 'air' ? '#7fb3d5' : '#8d8d8d' }); bn.add(b.name); b.auto = k; return b; };
+    const mkReg = (k, vis) => { const r = APP.addRegion(FK.uniqueName(A.names[k], rn), '', { visible: false, nvois: 5, color: k === 'global' ? '#5d6d7e' : k === 'air' ? '#7fb3d5' : '#8d8d8d' }); rn.add(r.name); r.auto = k; const mn = A.mats[k]; if (mn) { const mt = APP.materialByName(mn, true); if (mt) r.mat = mt.id; } if (k === 'global') r.noExport = true; return r; };
+    mkBody('air'); mkBody('bb'); const g = mkReg('global'), a = mkReg('air'), b = mkReg('bb');
+    APP.syncAuto();
+    S.sel = { t: 'region', id: a.id };
+    APP.changed({ tree: true, right: true });
+    return { global: g, air: a, bb: b };
+  };
+  /** Makes the three regions and the boxes ordinary objects (editable, no longer recomputed). */
+  APP.convertAuto = function () {
+    if (!APP.hasAuto()) return 0; APP.snap(); let n = 0;
+    for (const r of S.model.regions) if (r.auto) { delete r.auto; n++; }
+    for (const b of S.model.bodies) if (b.auto) { delete b.auto; n++; }
+    APP.changed({ tree: true, right: true }); return n;
+  };
+  APP.setAutoMargin = function (k, v) {
+    v = +v; if (!isFinite(v) || v < 0) return false;
+    S.model.autoCfg = S.model.autoCfg || {}; S.model.autoCfg[k] = v; APP.syncAuto(); return true;
+  };
+  APP.syncLinks = function () {
+    const regs = S.model && S.model.regions; if (!regs) return false;
+    let any = false, changed = false;
+    for (const r of regs) if (r.meta && r.meta.link) { any = true; break; }
+    if (!any) return false;
+    const byId = new Map(regs.map(r => [r.id, r]));
+    for (const r of regs) {                                  // parents that no longer exist: the link is dropped, the formula stays
+      const l = r.meta && r.meta.link; if (!l) continue;
+      if (l.more) l.more = l.more.filter(x => byId.has(x.id) && x.id !== r.id);   // an operand that no longer exists is simply dropped
+      if (!byId.has(l.a) || !byId.has(l.b) || l.a === r.id || l.b === r.id) { delete r.meta.link; changed = true; }
+    }
+    for (let pass = 0; pass <= regs.length; pass++) {        // chains (reg4 linked to reg3 linked to …) settle in a few passes; cycles stop here
+      let moved = false;
+      for (const r of regs) {
+        const l = r.meta && r.meta.link; if (!l) continue;
+        let e; try { e = byId.get(l.a).expr; for (const o of APP.linkOps(l)) e = FK.combineExpr(e, byId.get(o.id).expr, o.op, l.mode); if (l.simp) e = FK.simplifyExpr(e); if (l.lines) e = FK.zoneLines(e); l.error = ''; } catch (err) { l.error = err.message; continue; }
+        if (e !== r.expr) { r.expr = e; moved = true; changed = true; }
+      }
+      if (!moved) break;
+    }
+    return changed;
+  };
+  /** "Combine with another region": a new region linked to `a` and to one other region (union); more operations are added in the properties panel. */
+  APP.startCombine = function (a, op) {
+    const b = S.model.regions.find(x => x.id !== a.id);
+    if (!b) return { error: 'Create a second region first' };
+    const r = APP.createBoolRegion(a, b, op || 'union', 'compact', true);
+    return r;
+  };
+  APP.createBoolRegion = function (a, b, op, mode, strong) {
+    const pl = APP.boolPlan(a, b, op, mode);
+    if (pl.error) return pl;
+    APP.snap();
+    const reg = APP.addRegion(pl.regName, pl.expr, { visible: true, nvois: a.nvois });
+    reg.meta = { boolOf: [a.name, b.name, op] };
+    if (strong) reg.meta.link = { a: a.id, b: b.id, op, more: [], mode: mode || 'compact', error: '' };
+    S.sel = { t: 'region', id: reg.id };
+    APP.changed({ tree: true, right: true });
+    { const ev = APP.reportQuality(reg); if (!(ev.quality && ev.quality.length)) APP.toast(`Region ${reg.name} created (${a.name} ${op === 'sub' ? '−' : op === 'int' ? '∩' : '∪'} ${b.name}); the originals are unchanged${strong ? '; strong link: it follows ' + a.name + ' and ' + b.name : ''}`); }
+    return { region: reg, plan: pl };
+  };
+  /* ---------- Link between entities and their CAD mesh ---------- */
+  /** Id of the mesh an entity is linked to (0 = none). meta.cad: undefined = automatic (plane picked on a face, detected feature, region made of linked bodies), 0 = none, id = explicit. */
+  APP.cadId = function (it, kind) {
+    const m = it.meta || {};
+    if (m.cad === 0) return 0;
+    if (m.cad && APP.getStl(m.cad)) return m.cad;
+    if (kind === 'body') return m.src && m.src.kind === 'stl' && APP.getStl(m.src.id) ? m.src.id : 0;
+    let ids = new Set();
+    try { for (const n of FK.exprNames(FK.parseExpr(it.expr || '+x'))) { const b = S.model.bodies.find(x => x.name === n); const c = b ? APP.cadId(b, 'body') : 0; if (c) ids.add(c); } } catch (e) { return 0; }
+    return ids.size === 1 ? Array.from(ids)[0] : 0;
+  };
+  APP.cadLinked = (stlId) => ({
+    bodies: S.model.bodies.filter(b => !FK.isPlaneType(b.type) && APP.cadId(b, 'body') === stlId),
+    planes: S.model.bodies.filter(b => FK.isPlaneType(b.type) && APP.cadId(b, 'body') === stlId),
+    regions: S.model.regions.filter(r => APP.cadId(r, 'region') === stlId)
+  });
+  /** Show / hide / isolate everything linked to a mesh. */
+  APP.cadVisibility = function (stlId, mode) {
+    APP.snap();
+    const L = APP.cadLinked(stlId), inSet = new Set(L.bodies.concat(L.planes, L.regions));
+    for (const b of S.model.bodies) { if (inSet.has(b)) b.visible = mode !== 'hide'; else if (mode === 'isolate') b.visible = false; }
+    for (const r of S.model.regions) { if (inSet.has(r)) r.visible = mode !== 'hide'; else if (mode === 'isolate') r.visible = false; }
+    if (mode === 'isolate') for (const m of S.stls) m.visible = m.id === stlId;
+    APP.changed({ tree: true });
+    return inSet.size;
+  };
+  /* ---------- Detected features (experimental) ---------- */
+  /** Add a detected feature to the model as a body (world coordinates; a rotated box also gets its own coordinate system). */
+  APP.addFeature = function (f, stlId) {
+    APP.snap();
+    let cs = 0;
+    if (f.cs) cs = APP.addCsys(f.cs.slice(), { parent: 0, name: FK.uniqueName('bxcs1', csysNames()) }).id;
+    const b = APP.addBody(f.type, f.p.slice(), { cs, meta: Object.assign({ detected: f.kind }, stlId ? { cad: stlId } : {}) });
+    S.sel = { t: 'body', id: b.id };
+    APP.changed({ tree: true, right: true });
+    if (APP.hooks.suggestSnap) APP.hooks.suggestSnap(b);
+    return b;
+  };
+  APP.regionNameFor = (bodyName) => FK.uniqueName('r_' + bodyName.slice(0, 6), regionNames());
+
+  APP.createRpp = function (a, b, label) {
+    APP.snap();
+    a = APP.toLocal(a); b = APP.toLocal(b); // the two points are given in world space, the RPP lives in the active csys
+    const p = [Math.min(a[0], b[0]), Math.max(a[0], b[0]), Math.min(a[1], b[1]), Math.max(a[1], b[1]), Math.min(a[2], b[2]), Math.max(a[2], b[2])];
+    const body = APP.addBody('RPP', p);
+    S.sel = { t: 'body', id: body.id };
+    APP.changed({ tree: true, right: true });
+    return body;
+  };
+  APP.rppFromBox = function (box) { const b = APP.createRpp(box.min, box.max); if (APP.hooks.suggestSnap) APP.hooks.suggestSnap(b); return b; };
+
+  /* ---------- Planes and cuts ---------- */
+  APP.planeFromPick = function (pk, cs) {
+    const v = pk.seedVerts;
+    const inv = FK.M.inv(APP.csysWorld(cs === undefined ? S.model.active : cs));
+    const c = FK.M.apply(inv, V.mul(V.add(V.add(v[0], v[1]), v[2]), 1 / 3));
+    const n = FK.M.applyVec(inv, pk.normal);
+    return { p: [n[0], n[1], n[2], c[0], c[1], c[2]], meta: { src: { kind: pk.ownerKind, id: pk.ownerId, tri: pk.seed, verts: v } } };
+  };
+  APP.createPlaneFromPick = function (pk) {
+    APP.snap();
+    const pl = APP.planeFromPick(pk);
+    const b = APP.addBody('PLA', pl.p, { meta: pl.meta });
+    // the plane is only created: it is never added to a region automatically
+    const msg = `PLA ${b.name} created (add +${b.name} or -${b.name} to a region yourself)`;
+    S.sel = { t: 'body', id: b.id };
+    APP.changed({ tree: true, right: true });
+    APP.toast(msg);
+    if (APP.hooks.suggestSnap) APP.hooks.suggestSnap(b);
+    return b;
+  };
+  /** Adds +name / −name to one zone (index) or to every zone ('all') of a region expression. */
+  APP.addRegionTerm = function (r, zone, sign, name) {
+    if (r.meta && r.meta.link) return { error: 'This region follows a live link: its formula is read-only' };
+    let ast; try { ast = (r.expr || '').trim() ? FK.parseExpr(r.expr) : { zones: [[]] }; } catch (e) { return { error: e.message }; }
+    if (!ast.zones.length) ast.zones = [[]];
+    const targets = zone === 'all' ? ast.zones : [ast.zones[Math.min(Math.max(0, +zone || 0), ast.zones.length - 1)]];
+    for (const z of targets) if (!z.some(x => x.name === name && (x.sign > 0) === (sign > 0))) z.push({ sign: sign > 0 ? 1 : -1, name });
+    r.expr = FK.formatExpr(ast);
+    return { ok: true, zones: ast.zones.length };
+  };
+  /** Plane through the picked face: an existing identical plane is reused, otherwise a PLA is created (not selected). Returns { body, created }. */
+  APP.planeForCut = function (pk) {
+    const v = pk.seedVerts, c = V.mul(V.add(V.add(v[0], v[1]), v[2]), 1 / 3), n = V.norm(pk.normal);
+    for (const b of S.model.bodies) {
+      if (!FK.isPlaneType(b.type)) continue;
+      const pl = FK.planeOf(APP.wbody(b)); if (!pl) continue;
+      // the same plane (or the same plane seen from the other side) within a tiny tolerance is re-used: two cuts meant to coincide must not leave a wedge
+      const m = V.norm(pl.H), dt = V.dot(m, n), angTol = (S.opt.cutMergeAng === undefined ? 0.05 : S.opt.cutMergeAng) * Math.PI / 180, dTol = (S.opt.cutMergeTol === undefined ? 0.01 : S.opt.cutMergeTol) / 10;
+      if (Math.abs(dt) > Math.cos(angTol) && Math.abs(V.dot(m, V.sub(c, pl.V))) < dTol) return { body: b, created: false, flip: dt < 0 };
+    }
+    const pl = APP.planeFromPick(pk);
+    const b = APP.addBody('PLA', pl.p, { meta: pl.meta });
+    return { body: b, created: true };
+  };
+  APP.reassignPlane = function (bodyId, pk) {
+    const b = APP.getBody(bodyId); if (!b || b.type !== 'PLA') return;
+    APP.snap();
+    const pl = APP.planeFromPick(pk, b.cs || 0);
+    b.p = pl.p; b.meta = Object.assign({}, b.meta, pl.meta);
+    APP.changed({ tree: true, right: true });
+    APP.toast(`Plane ${b.name} recomputed from the new face`);
+  };
+
+  /* ---------- Organisation groups (tool only: no effect on the CG output) ---------- */
+  const CAT_ITEMS = {
+    meshes: () => S.stls, csys: () => S.model.csys, planes: () => S.model.bodies.filter(b => FK.isPlaneType(b.type)),
+    bodies: () => S.model.bodies.filter(b => !FK.isPlaneType(b.type)), regions: () => S.model.regions, measures: () => S.measures
+  };
+  APP.catItems = (k) => CAT_ITEMS[k]();
+  APP.catOf = (t, o) => t === 'material' ? 'materials' : t === 'comp' ? 'comps' : t === 'stl' ? 'meshes' : t === 'csys' ? 'csys' : t === 'region' ? 'regions' : t === 'measure' ? 'measures' : (FK.isPlaneType(o.type) ? 'planes' : 'bodies');
+  APP.groups = () => S.model.groups || (S.model.groups = []);
+  APP.getGroup = (id) => APP.groups().find(g => g.id === id);
+  APP.groupMembers = (g) => CAT_ITEMS[g.k]().filter(o => o.grp === g.id);
+  APP.addGroup = function (k, name) {
+    APP.snap();
+    const n = APP.groups().filter(g => g.k === k).length + 1;
+    const g = { id: APP.nid(), k, name: name || 'Group ' + n, open: true };
+    APP.groups().push(g); return g;
+  };
+  /** Move an item into a group (gid 0 / falsy = back to the loose items of its category). */
+  APP.setItemGroup = function (t, o, gid) {
+    const g = gid ? APP.getGroup(gid) : null;
+    if (g && g.k !== APP.catOf(t, o)) return false;
+    APP.snap();
+    if (g) { o.grp = g.id; g.open = true; } else delete o.grp;
+    return true;
+  };
+  APP.deleteGroup = function (id) {
+    const g = APP.getGroup(id); if (!g) return;
+    APP.snap();
+    APP.groupMembers(g).forEach(o => { delete o.grp; });
+    S.model.groups = APP.groups().filter(x => x.id !== id);
+  };
+  APP.setGroupVisible = function (g, on) { APP.snap(); APP.groupMembers(g).forEach(o => { o.visible = on; }); };
+
+  /* ---------- Duplicate, delete, rename ---------- */
+  APP.duplicateBody = function (b) {
+    APP.snap();
+    const c = JSON.parse(JSON.stringify(b));
+    c.id = APP.nid(); c.name = FK.uniqueName(b.name.replace(/\d+$/, '') + '1', bodyNames());
+    if (c.name === b.name) c.name = FK.uniqueName(b.name, bodyNames());
+    S.model.bodies.push(c);
+    return c;
+  };
+  APP.duplicateRegion = function (r) {
+    APP.snap();
+    const c = JSON.parse(JSON.stringify(r));
+    c.id = APP.nid(); c.name = FK.uniqueName(r.name.replace(/\d+$/, '') + '1', regionNames());
+    S.model.regions.push(c);
+    return c;
+  };
+  /** Deletes several items [{ t, o }] in one undo step. */
+  APP.deleteItems = function (list) {
+    if (list.some(x => (x.t === 'body' || x.t === 'region') && x.o.auto)) { list = list.filter(x => !((x.t === 'body' || x.t === 'region') && x.o.auto)); APP.toast('Automatic objects are not deleted'); if (!list.length) return; }
+    APP.snap();
+    const ids = (ty) => new Set(list.filter(x => x.t === ty).map(x => x.o.id));
+    const bi = ids('body'), ri = ids('region'), mi = ids('measure'), si = ids('stl');
+    if (bi.size) S.model.bodies = S.model.bodies.filter(b => !bi.has(b.id));
+    if (ri.size) { S.model.regions = S.model.regions.filter(r => !ri.has(r.id)); for (const r of S.model.regions) if (ri.has(r.parent)) delete r.parent; }
+    if (mi.size) S.measures = S.measures.filter(m => !mi.has(m.id));
+    if (si.size) { for (const s of S.stls.filter(x => si.has(x.id))) if (APP.hooks.disposeStl) APP.hooks.disposeStl(s); S.stls = S.stls.filter(x => !si.has(x.id)); }
+    for (const x of list) { if (x.t === 'csys') APP.deleteCsys(x.o.id); else if (x.t === 'comp') APP.deleteComp(x.o.id, false); else if (x.t === 'material') APP.deleteMaterial(x.o.id); }
+    S.sel = null; S.multi = null;
+    APP.changed({ tree: true, right: true, measures: true });
+  };
+  APP.deleteSel = function () {
+    if (!S.sel) return;
+    const { t, id } = S.sel;
+    if (t === 'csys') { APP.deleteCsys(id); return; }
+    if (t === 'comp') { APP.deleteComp(id, false); return; }
+    if (t === 'material') { APP.deleteMaterial(id); return; }
+    { const it0 = t === 'body' ? APP.getBody(id) : t === 'region' ? APP.getRegion(id) : null; if (it0 && it0.auto) { APP.toast('Automatic object: use "Convert to ordinary regions" to edit or delete it'); return; } }
+    APP.snap();
+    if (t === 'body') S.model.bodies = S.model.bodies.filter(b => b.id !== id);
+    else if (t === 'region') { S.model.regions = S.model.regions.filter(r => r.id !== id); for (const r of S.model.regions) if (r.parent === id) delete r.parent; }
+    else if (t === 'measure') S.measures = S.measures.filter(m => m.id !== id);
+    else if (t === 'stl') { const s = APP.getStl(id); if (s && APP.hooks.disposeStl) APP.hooks.disposeStl(s); S.stls = S.stls.filter(x => x.id !== id); }
+    S.sel = null;
+    APP.changed({ tree: true, right: true, measures: true });
+  };
+  /** Spaces and special characters are not allowed in the names of bodies and regions (they would break the region expressions). */
+  const cleanTyped = (nn) => { const c = FK.cleanObjectName(nn); if (c !== String(nn).trim()) APP.toast('Spaces and special characters are replaced by _ in object names'); return c; };
+  APP.renameBody = function (b, nn) {
+    nn = cleanTyped(nn);
+    if (!nn || nn === b.name) return false;
+    if (b.auto) { APP.toast('Automatic object: its name cannot be changed'); return false; }
+    if (S.model.bodies.some(x => x !== b && x.name === nn)) { APP.toast('A body with this name already exists'); return false; }
+    APP.snap();
+    const old = b.name; b.name = nn;
+    for (const r of S.model.regions) r.expr = FK.renameInExpr(r.expr, old, nn);
+    APP.changed({ tree: true });
+    return true;
+  };
+  APP.renameRegion = function (r, nn) {
+    nn = cleanTyped(nn);
+    if (!nn || nn === r.name) return false;
+    if (r.auto) { APP.toast('Automatic region: its name cannot be changed'); return false; }
+    if (S.model.regions.some(x => x !== r && x.name === nn)) { APP.toast('A region with this name already exists'); return false; }
+    APP.snap(); r.name = nn; APP.changed({ tree: true });
+    return true;
+  };
+
+
+  /* ---------- Parametric components (see tpl.js) ---------- */
+  // A component owns ordinary bodies and regions (found again through meta.comp.role) and regenerates them when a parameter changes.
+  const linkedTo = (r) => S.model.regions.filter(x => x !== r && x.meta && x.meta.link && APP.linkIds(x.meta.link).includes(r.id));
+  const compName = (c, role) => FK.cleanObjectName(c.prefix + '_' + role);
+  APP.compItems = function (c) {
+    const out = { bodies: [], regions: [] };
+    for (const k of Object.keys(c.items || {})) {
+      if (k[0] === 'b') { const b = APP.getBody(c.items[k]); if (b) out.bodies.push(b); }
+      else { const r = APP.getRegion(c.items[k]); if (r) out.regions.push(r); }
+    }
+    return out;
+  };
+  APP.compOf = (o) => o && o.meta && o.meta.comp ? APP.getComp(o.meta.comp.id) || null : null;
+  /** Rebuild the generated bodies/regions from the parameters. Returns false (and sets c.error) when the parameters are invalid. */
+  APP.compRegen = function (c) {
+    const res = FK.tplBuild(c.tpl, c.params);
+    if (res.error) { c.error = res.error; return false; }
+    c.error = ''; c.info = res.info || [];
+    if (!APP.getCsys(c.cs)) c.cs = APP.addCsys(M.id(), { parent: S.model.active || 0, name: FK.uniqueName(c.prefix + '_cs', csysNames(), 40) }).id;
+    c.items = c.items || {};
+    const names = {}, keep = new Set();
+    for (const bd of res.bodies) {
+      const key = 'b:' + bd.role; keep.add(key);
+      let b = APP.getBody(c.items[key]);
+      if (!b) {
+        b = APP.addBody(bd.type, bd.p.slice(), { cs: c.cs, name: FK.uniqueName(compName(c, bd.role), bodyNames(), 40), meta: { comp: { id: c.id, role: bd.role } }, visible: false });
+        c.items[key] = b.id;
+      } else { b.type = bd.type; b.p = bd.p.slice(); b.cs = c.cs; }
+      names[bd.role] = b.name;
+    }
+    for (const rg of res.regions) {
+      const key = 'r:' + rg.role; keep.add(key);
+      const expr = rg.expr.replace(/\{(\w+)\}/g, (m, k) => names[k] || m);
+      let r = APP.getRegion(c.items[key]);
+      if (!r) {
+        r = APP.addRegion(FK.uniqueName(compName(c, rg.role), regionNames(), 40), expr, { visible: c.visible !== false });
+        r.meta = Object.assign(r.meta || {}, { comp: { id: c.id, role: rg.role } });
+        c.items[key] = r.id;
+      } else r.expr = expr;
+    }
+    for (const key of Object.keys(c.items)) if (!keep.has(key)) {
+      const id = c.items[key]; delete c.items[key];
+      if (key[0] === 'r') {
+        const r = APP.getRegion(id); if (!r) continue;
+        const used = linkedTo(r).length > 0;
+        if (used) { delete r.meta.comp; APP.toast('Region "' + r.name + '" is used elsewhere: kept as a normal region'); }
+        else S.model.regions = S.model.regions.filter(x => x !== r);
+      } else {
+        const b = APP.getBody(id); if (!b) continue;
+        S.model.bodies = S.model.bodies.filter(x => x !== b);
+      }
+    }
+    return true;
+  };
+  APP.compCreate = function (tpl) {
+    const t = FK.TEMPLATES[tpl]; if (!t) return null;
+    APP.snap();
+    const comps = S.model.components = S.model.components || []; S.model.materials = S.model.materials || FK.defaultMaterials();
+    const prefix = FK.uniqueName(t.prefix + '1', new Set(comps.map(x => x.prefix)), 20);
+    const c = { id: APP.nid(), name: prefix, prefix, tpl, params: FK.tplDefaults(tpl), cs: 0, items: {}, visible: true, visApplied: true, error: '', info: [] };
+    c.cs = APP.addCsys(M.id(), { parent: S.model.active || 0, name: FK.uniqueName(prefix + '_cs', csysNames(), 40) }).id;
+    comps.push(c);
+    APP.compRegen(c);
+    S.sel = { t: 'comp', id: c.id };
+    APP.changed({ tree: true, right: true });
+    return c;
+  };
+  APP.compSetParam = function (c, k, v, soft) {
+    c.params[k] = v;
+    APP.compRegen(c);
+    APP.changed({ tree: true, right: !soft });
+  };
+  APP.compSetPrefix = function (c, np) {
+    np = (np || '').trim().replace(/\s+/g, '_');
+    if (!np || np === c.prefix) return false;
+    if (S.model.components.some(x => x !== c && x.prefix === np)) { APP.toast('Another component already uses this prefix'); return false; }
+    APP.snap();
+    const old = c.prefix; c.prefix = np;
+    for (const k of Object.keys(c.items)) {
+      const role = k.slice(2);
+      if (k[0] === 'b') { const b = APP.getBody(c.items[k]); if (b && b.name === old + '_' + role) APP.renameBody(b, FK.uniqueName(np + '_' + role, bodyNames(), 40)); }
+      else { const r = APP.getRegion(c.items[k]); if (r && r.name === old + '_' + role) APP.renameRegion(r, FK.uniqueName(np + '_' + role, regionNames(), 40)); }
+    }
+    APP.changed({ tree: true, right: true });
+    return true;
+  };
+  /** Remove the component but keep its objects as ordinary (editable) bodies and regions. */
+  APP.compDetach = function (c) {
+    APP.snap();
+    for (const o of APP.compItems(c).bodies.concat(APP.compItems(c).regions)) delete o.meta.comp;
+    S.model.components = S.model.components.filter(x => x !== c);
+    if (S.sel && S.sel.t === 'comp') S.sel = null;
+    APP.changed({ tree: true, right: true });
+  };
+  APP.deleteComp = function (id, keepItems) {
+    const c = APP.getComp(id); if (!c) return;
+    if (keepItems) { APP.compDetach(c); return; }
+    APP.snap();
+    const it = APP.compItems(c);
+    S.model.regions = S.model.regions.filter(r => !it.regions.includes(r));
+    S.model.bodies = S.model.bodies.filter(b => !it.bodies.includes(b));
+    S.model.components = S.model.components.filter(x => x !== c);
+    // the placement csys goes too when it only served this component
+    const cs = APP.getCsys(c.cs);
+    if (cs && !S.model.bodies.some(b => b.cs === cs.id) && !S.model.csys.some(x => x.parent === cs.id) && S.model.active !== cs.id && S.model.exportCs !== cs.id && !S.model.components.some(x => x.cs === cs.id)) S.model.csys = S.model.csys.filter(x => x !== cs);
+    if (S.sel && S.sel.t === 'comp') S.sel = null;
+    const broken = S.model.regions.filter(r => r.meta && r.meta.link && (it.regions.some(g => APP.linkIds(r.meta.link).includes(g.id)))).map(r => r.name);
+    if (broken.length) APP.toast('⚠ ' + broken.join(', ') + ' used a deleted region');
+    APP.changed({ tree: true, right: true });
+  };
+  /** Propagate the component toggle to its regions (called on every change). */
+  APP.syncComps = function () {
+    for (const c of S.model.components || []) {
+      if (c.visApplied === c.visible) continue;
+      c.visApplied = c.visible;
+      for (const r of APP.compItems(c).regions) r.visible = c.visible !== false;   // the component toggle drives its regions (the bodies keep their own state)
+    }
+  };
+
+
+  /* ---------- Materials (names only; they are written as ASSIGNMA cards) ---------- */
+  /** Material with this name (created when `create` is set and it does not exist yet). */
+  APP.materialByName = function (name, create) {
+    const nm = FK.cleanMaterialName(name); if (!nm) return null;
+    const list = S.model.materials = S.model.materials || FK.defaultMaterials();
+    let m = list.find(x => x.name === nm);
+    if (!m && create) { m = { id: list.reduce((a, x) => Math.max(a, x.id), 0) + 1, name: nm }; list.push(m); }
+    return m || null;
+  };
+  APP.addMaterial = function (name) {
+    const list = S.model.materials = S.model.materials || FK.defaultMaterials();
+    let nm = FK.cleanMaterialName(name || 'MAT1') || 'MAT1';
+    if (list.some(x => x.name === nm)) nm = FK.uniqueName(nm, new Set(list.map(x => x.name)));
+    APP.snap();
+    const m = APP.materialByName(nm, true);
+    S.sel = { t: 'material', id: m.id };
+    APP.changed({ tree: true, right: true });
+    return m;
+  };
+  APP.renameMaterial = function (m, nn) {
+    nn = FK.cleanMaterialName(nn);
+    if (!nn || nn === m.name) return false;
+    if (S.model.materials.some(x => x !== m && x.name === nn)) { APP.toast('This material already exists'); return false; }
+    APP.snap(); m.name = nn; APP.changed({ tree: true, right: true }); return true;
+  };
+  APP.deleteMaterial = function (id) {
+    const m = APP.getMaterial(id); if (!m) return;
+    APP.snap();
+    let n = 0; for (const r of S.model.regions) if (r.mat === id) { delete r.mat; n++; }
+    S.model.materials = S.model.materials.filter(x => x !== m);
+    if (S.sel && S.sel.t === 'material') S.sel = null;
+    if (n) APP.toast(`⚠ ${n} region${n > 1 ? 's' : ''} lost ${m.name}`);
+    APP.changed({ tree: true, right: true });
+  };
+  APP.setRegionMaterial = function (r, id) {
+    APP.snap('mat' + r.id);
+    if (id) r.mat = id; else delete r.mat;
+    APP.changed({ tree: true, right: true });
+  };
+  APP.regionsOfMaterial = (id) => S.model.regions.filter(r => r.mat === id);
+  /** Small example matching the usual structure of an input file (black body, void, target). */
+  APP.loadExample = function () {
+    APP.newModel(false);
+    S.model.title = 'Dummy example';
+    const bb = APP.addBody('SPH', [0, 0, 0, 100000], { name: 'blkbody', cs: 0, visible: false });
+    const vd = APP.addBody('SPH', [0, 0, 0, 10000], { name: 'void', cs: 0, visible: false });
+    const tg = APP.addBody('RCC', [0, 0, 0, 0, 0, 10, 5], { name: 'target', cs: 0 });
+    const mk = (n, e, mat) => { const r = APP.addRegion(n, e, { visible: n === 'TARGET' }); r.mat = APP.materialByName(mat, true).id; return r; };
+    mk('BLKBODY', `+${bb.name} -${vd.name}`, 'BLCKHOLE'); mk('VOID', `+${vd.name} -${tg.name}`, 'VACUUM'); mk('TARGET', `+${tg.name}`, 'COPPER');
+    APP.changed({ tree: true, right: true, fit: true });
+  };
+
+  /* ---------- Scale / margin ---------- */
+  APP.scaleBody = function (b, mode, val, unit, dup) {
+    let target = b;
+    const v = mode === 'pct' ? val / 100 : (unit === 'mm' ? val / 10 : val);
+    if (mode === 'pct' && !(v > 0)) { APP.toast('Invalid scale'); return null; }
+    const test = JSON.parse(JSON.stringify(b));
+    if (!FK.scaleBody(test, mode, v)) { APP.toast(mode === 'pct' ? 'Percent scaling is not applicable to this body (use a margin)' : 'Not applicable to this body'); return null; }
+    APP.snap();
+    if (dup) { target = APP.duplicateBody(b); }
+    FK.scaleBody(target, mode, v);
+    if (target.meta && target.meta.src) delete target.meta.src; // the plane is no longer tied to the face
+    S.sel = { t: 'body', id: target.id };
+    APP.changed({ tree: true, right: true });
+    return target;
+  };
+
+  /* ---------- Void / blackhole envelope ---------- */
+  APP.addEnvelope = function () {
+    APP.snap();
+    const W = S.W || { min: [-50, -50, -50], max: [50, 50, 50] };
+    const c = FK.boxCenter(W), R = Math.max(FK.boxDiag(W) * 0.6, 10);
+    const used = bodyNames();
+    const bh = APP.addBody('SPH', [c[0], c[1], c[2], +(R * 1.2).toFixed(3)], { name: FK.uniqueName('blkbody', used), visible: false });
+    used.add(bh.name);
+    const vd = APP.addBody('SPH', [c[0], c[1], c[2], +R.toFixed(3)], { name: FK.uniqueName('void', used), visible: false });
+    const rbb = APP.addRegion(FK.uniqueName('BB_void', regionNames()), `+${bh.name} -${vd.name}`, { visible: false });
+    { const m = APP.materialByName('BLCKHOLE'); if (m) rbb.mat = m.id; }
+    const inner = S.model.bodies.filter(b => b !== bh && b !== vd && !FK.isPlaneType(b.type) && !FK.isInfiniteType(b.type) && b.type !== 'RAW');
+    const rout = APP.addRegion(FK.uniqueName('rOut', regionNames()), `+${vd.name}` + inner.map(b => ' -' + b.name).join(''), { visible: false });
+    { const m = APP.materialByName('VACUUM'); if (m) rout.mat = m.id; }
+    APP.changed({ tree: true, right: true });
+    APP.toast('Envelope added: adjust it (rOut = void minus all finite bodies)');
+  };
+
+  /* ---------- Importing an INP block ---------- */
+  APP.importInp = function (text, mode) {
+    const res = FK.parseInp(text);
+    const imp = res.model;
+    if (!imp.bodies.length && !imp.regions.length) { APP.toast('No body or region found in this text'); return res; }
+    APP.snap();
+    if (mode === 'replace') { S.model = { title: imp.title, bodies: [], regions: [], tail: imp.tail || [], csys: S.model.csys || [], active: S.model.active || 0, groups: S.model.groups || [], components: [], materials: S.model.materials || FK.defaultMaterials(), exportCs: S.model.exportCs || 0 }; S.sel = null; }
+    const used = bodyNames(), map = new Map(), xfCs = new Map();
+    // a coordinate system of the same name and the same placement (previous import of the same file) is reused instead of duplicated
+    const csFor = (name, W) => {
+      const nm = String(name || 'TR').replace(/[^A-Za-z0-9_]/g, '') || 'TR', cl = M.clean(W, 1e-6), Wc = cl.ok ? cl.m : W;
+      const same = S.model.csys.find(c => c.name === nm && (() => { try { const Q = APP.csysWorld(c.id); return Q.every((v, i) => Math.abs(v - Wc[i]) < 1e-6); } catch (e) { return false; } })());
+      return same || APP.addCsys(Wc, { name: FK.uniqueName(nm, csysNames()), parent: 0 });
+    };
+    for (const b of imp.bodies) {
+      let nm = b.name;
+      if (used.has(nm)) nm = FK.uniqueName(nm, used);
+      map.set(b.name, nm); used.add(nm);
+      b.name = nm; b.id = APP.nid(); b.cs = APP.exportCs(); // INP coordinates are in the export frame
+      if (b.xfm) {                                           // written inside $Start_transform: the body keeps its own coordinates in a new coordinate system
+        let c = xfCs.get(b.xfKey);
+        if (!c) {
+          c = csFor(b.xfName, M.mul(APP.csysWorld(APP.exportCs()), b.xfm)); xfCs.set(b.xfKey, c);
+        }
+        b.cs = c.id;
+      }
+      delete b.xfm; delete b.xfName; delete b.xfKey;
+      S.model.bodies.push(b);
+    }
+    // transformations defined by ROT-DEFI cards but used by no body: coordinate systems too (to attach objects later)
+    const xfUsed = new Set([...xfCs.keys()].join('>').split('>').map(n => n.replace(/^-/, ''))), xfNew = [];
+    for (const t of res.transforms || []) {
+      if (xfUsed.has(t.name) || FK.M.isIdentity(t.m, 1e-12)) continue;
+      csFor(t.name, M.mul(APP.csysWorld(APP.exportCs()), t.m)); xfNew.push(t.name);
+    }
+    res.xfInfo = { total: (res.transforms || []).length, created: xfCs.size + xfNew.length, unused: xfNew, bodies: imp.bodies.filter(b => b.cs !== APP.exportCs()).length };
+    const rused = regionNames(), rByOrig = new Map();
+    for (const r of imp.regions) {
+      try {
+        const ast = FK.parseExpr(r.expr);
+        (function walk(a) { for (const z of a.zones) for (const t of z) { if (t.name && map.has(t.name)) t.name = map.get(t.name); else if (t.sub) walk(t.sub); } })(ast);
+        r.expr = FK.formatExpr(ast);
+      } catch (e) { /* garder */ }
+      const origName = r.name;
+      if (rused.has(r.name)) r.name = FK.uniqueName(r.name, rused);
+      rused.add(r.name); rByOrig.set(origName, r); r.id = APP.nid(); S.model.regions.push(r);
+    }
+    // hide the "envelope" bodies (very large compared to the rest) and the regions that depend on them by default
+    const stlBoxes = S.stls.filter(s => s.stats && s.stats.bbox).map(s => s.stats.bbox);
+    const W0 = FK.computeWorldBox(stlBoxes, S.model.bodies.map(APP.wbody), 10), d0 = FK.boxDiag(W0);
+    const hidden = new Set();
+    for (const b of imp.bodies) {
+      if (b.type === 'RAW') { b.visible = false; continue; }
+      const bb = FK.bodyBBox(APP.wbody(b));
+      if (bb && FK.boxDiag(bb) > 2.5 * d0) { b.visible = false; hidden.add(b.name); }
+    }
+    for (const r of imp.regions) {
+      try {
+        const ast = FK.parseExpr(r.expr);
+        let dep = false;
+        for (const z of ast.zones) for (const t of z) if (t.name && t.sign > 0 && hidden.has(t.name)) dep = true;
+        r.visible = !dep;
+      } catch (e) { r.visible = false; }
+    }
+    for (const a of res.assign || []) { const r = rByOrig.get(a.region); if (r) { const m = APP.materialByName(a.material, true); if (m) r.mat = m.id; } }   // ASSIGNMA cards after GEOEND
+    S.opt.style = S.opt.style || 1;
+    APP.changed({ tree: true, right: true, fit: true });
+    return res;
+  };
+
+  APP.newModel = function (all) {
+    APP.snap(); S.checksOff = false;
+    if (all) { for (const m of S.stls) if (APP.hooks.disposeStl) APP.hooks.disposeStl(m); S.stls = []; }
+    S.model = { title: 'Geometry', bodies: [], regions: [], tail: [], csys: [], active: 0, groups: [], components: [], materials: FK.defaultMaterials() };
+    S.measures = []; S.sel = null; S.pick = null; S.pending = null; S.fill = null;
+    APP.changed({ tree: true, right: true, measures: true, fit: !!all });
+  };
+
+  /* ---------- INP text ---------- */
+  /** Is the body referenced by at least one region expression? */
+  APP.bodyUsed = (b) => S.model.regions.some(r => { try { return FK.exprNames(FK.parseExpr(r.expr || '+x')).has(b.name); } catch (e) { return (r.expr || '').includes(b.name); } });
+  /** Bodies exported to the INP that no exported region uses. */
+  APP.unusedBodies = function () {
+    const used = new Set();
+    for (const r of S.model.regions) { if (r.noExport) continue; try { for (const n of FK.exprNames(FK.parseExpr(r.expr || ''))) used.add(n); } catch (e) { /* ignored */ } }
+    return S.model.bodies.filter(b => !b.noExport && !used.has(b.name));
+  };
+  /** What stops working when an item is no longer exported. Bodies → the regions that use them, then (chain) every region whose live link
+   *  follows one of those; regions → regions linked to them. Returns [{ kind, item, depth, via }]. */
+  APP.exportImpact = function (kind, item) {
+    // Only bodies matter: a region's expression is written with bodies, never with other regions (a live link between two regions exists only in this tool).
+    if (kind !== 'body') return [];
+    const out = [];
+    for (const r of S.model.regions) { let has = false; try { has = FK.exprNames(FK.parseExpr(r.expr || '')).has(item.name); } catch (e) { has = false; } if (has) out.push({ kind: 'region', item: r, depth: 1, via: item.name }); }
+    return out;
+  };
+  /** Name written in the INP file for a body or a region. */
+  APP.inpNameOf = function (kind, item) { const nm = FK.inpNames(S.model); return (kind === 'region' ? nm.regions : nm.bodies).get(item) || item.name; };
+  /** Best short INP name for an item: its own name when it fits and is free; else its trailing number (≤ 2 digits) kept, or the first letters + 2 digits. */
+  APP.smartInpName = function (kind, item) {
+    const list = kind === 'region' ? S.model.regions : S.model.bodies, map = (kind === 'region' ? FK.inpNames(S.model).regions : FK.inpNames(S.model).bodies);
+    const taken = new Set(list.filter(x => x !== item).map(x => map.get(x)));
+    if (/^[A-Za-z][A-Za-z0-9_]{0,7}$/.test(item.name) && !taken.has(item.name)) return item.name;
+    let base = item.name.replace(/[^A-Za-z0-9]/g, ''); if (!/^[A-Za-z]/.test(base)) base = (kind === 'region' ? 'R' : 'B') + base;
+    const stem0 = base.replace(/\d+$/, '') || base, tm = base.match(/(\d{1,2})$/);
+    if (tm) { const c = stem0.slice(0, 8 - tm[1].length) + tm[1]; if (stem0 && !taken.has(c)) return c; }
+    const stem = stem0.slice(0, 6);
+    for (let k = 1; k < 100; k++) { const c = stem + String(k).padStart(2, '0'); if (!taken.has(c)) return c; }
+    return base.slice(0, 8);
+  };
+  APP.setSmartInpName = function (kind, item) { const n = APP.smartInpName(kind, item); if (n === item.name) delete item.inpName; else item.inpName = n; return n; };
+  /** Gives a proper short name to every exported object whose INP name differs from its name. Returns the count. */
+  APP.autoInpAll = function () {
+    const nm = FK.inpNames(S.model), todo = [];
+    for (const b of nm.shortened) todo.push([S.model.regions.includes(b) ? 'region' : 'body', b]);
+    const todoN = todo.filter(([, it]) => !it.noExport); if (!todoN.length) return 0;
+    APP.snap(); todoN.forEach(([k, it]) => APP.setSmartInpName(k, it)); APP.changed({ tree: true, right: true }); return todoN.length;
+  };
+  /** Coordinate systems that no exported body is defined in (and that are not the export frame): nothing refers to them in the INP file.
+   *  force = true keeps those marked "export anyway" in the list (default: they are not reported). */
+  APP.csysUnused = function (force) {
+    const ex = APP.exportCs(), used = new Set(S.model.bodies.filter(b => !b.noExport).map(b => b.cs || 0));
+    return (S.model.csys || []).filter(c => c.id !== ex && !used.has(c.id) && (force || !c.forceExport));
+  };
+  /** Transformations of the coordinate systems marked "export anyway" (transform mode: their ROT-DEFI card is written even if no body uses them). */
+  APP.forcedXf = () => (S.model.csys || []).filter(c => c.forceExport && c.id !== APP.exportCs()).map(c => ({ key: c.id, name: c.name, m: APP.relM({ cs: c.id }) }));
+  /** Stops exporting every body that no exported region uses. Returns the number of bodies affected. */
+  APP.skipUnusedBodies = function () { const u = APP.unusedBodies(); if (!u.length) return 0; APP.snap(); u.forEach(b => { b.noExport = true; }); APP.changed({ tree: true, right: true }); return u.length; };
+  /** Options of the INP generator. Transform mode: each body is written in the frame of its coordinate system inside $Start_transform / $End_transform (ROT-DEFI cards after GEOEND). */
+  APP.inpOpts = () => ({
+    style: S.opt.style, zoneLines: S.opt.inpZones !== false, comments: +S.opt.inpComments || 0, noNegParen: S.opt.inpNoNeg !== false, maxZones: APP.maxZones(), zonesPerLine: S.opt.zonesPerLine || 1, resolve: APP.xbody, transform: !!S.opt.inpTransform, forceXf: S.opt.inpTransform ? APP.forcedXf() : [],
+    xf: (b) => { const cs = b.cs || 0; return { key: cs, name: cs ? APP.csysLabel(cs) : 'Global', m: APP.relM(b) }; },
+    comment: S.opt.inpComment ? `${FK.APP_NAME} v${FK.VERSION}` : ''
+  });
+  /** What the INP really contains for each body: Map(body → parts) in the export frame (a rotated RPP gives the bounding RPP + its cutting planes). Empty in transform mode. */
+  APP.exportParts = () => S.opt.inpTransform ? new Map() : FK.exportParts(APP.expModel(), Object.assign({}, APP.inpOpts(), { transform: false }));
+  APP.inpText = () => (S.opt.inpFull !== false ? FK.generateFullInp : FK.generateInp)(APP.expModel(), APP.inpOpts());
+  /** The checks as records { sev: 'e' | 'w' | 'i', text, t, id } — t / id point to the geometry concerned (body / region) when it can be found. */
+  const ERR_RE = /duplicate name|invalid name|unknown body|empty expression|non-numeric|is used by|unexpected|expected|unbalanced|syntax|cannot|unreadable/i;
+  const INFO_RE = /Transform mode|merged into identical|not used by any exported region|written in coordinate system|will be shortened|type not displayed|exported as|cut to 60/i;
+  APP.issues = () => APP.warnings().map(text => {
+    const sev = ERR_RE.test(text) ? 'e' : INFO_RE.test(text) ? 'i' : 'w';
+    const regFirst = /^Region\b/.test(text), rec = { sev, text };
+    if (/^Coordinate system\b/.test(text)) { const m0 = text.match(/"([^"]+)"/), c0 = m0 && S.model.csys.find(x => x.name === m0[1]); if (c0) { rec.t = 'csys'; rec.id = c0.id; return rec; } }
+    for (const m of text.matchAll(/"([^"]+)"/g)) {
+      const r = S.model.regions.find(x => x.name === m[1]), b = S.model.bodies.find(x => x.name === m[1]);
+      const hit = regFirst ? (r ? ['region', r] : b ? ['body', b] : null) : (b ? ['body', b] : r ? ['region', r] : null);
+      if (hit) { rec.t = hit[0]; rec.id = hit[1].id; break; }
+    }
+    return rec;
+  });
+  /* ---------- Temporary isolation of objects (used by the surface check) ---------- */
+  APP.isolate = function (spec) {
+    const snap = S.isoSnap || (S.isoSnap = { b: {}, r: {}, s: {} });
+    for (const b of S.model.bodies) { if (!(b.id in snap.b)) snap.b[b.id] = b.visible; b.visible = (spec.bodies || []).includes(b.name); }
+    for (const r of S.model.regions) { if (!(r.id in snap.r)) snap.r[r.id] = r.visible; r.visible = (spec.regions || []).includes(r.name); }
+    for (const m of S.stls) { if (!(m.id in snap.s)) snap.s[m.id] = m.visible; m.visible = !!spec.meshes; }
+    APP.changed({ tree: true });
+  };
+  APP.restoreIsolation = function () {
+    const snap = S.isoSnap; if (!snap) return false;
+    for (const b of S.model.bodies) if (b.id in snap.b) b.visible = snap.b[b.id];
+    for (const r of S.model.regions) if (r.id in snap.r) r.visible = snap.r[r.id];
+    for (const m of S.stls) if (m.id in snap.s) m.visible = snap.s[m.id];
+    S.isoSnap = null; APP.changed({ tree: true }); return true;
+  };
+  /** "Only what the INP file contains": every exported body / region is shown (even if it was hidden), the others are hidden; the previous visibility comes back when the mode is left. */
+  APP.setOnlyExported = function (on) {
+    if (on) {
+      S.opt.onlyExpSnap = { b: {}, r: {} };
+      for (const b of S.model.bodies) { S.opt.onlyExpSnap.b[b.id] = [b.visible, !b.noExport]; b.visible = !b.noExport; }
+      for (const r of S.model.regions) { S.opt.onlyExpSnap.r[r.id] = [r.visible, !r.noExport]; r.visible = !r.noExport; }
+    } else if (S.opt.onlyExpSnap) {
+      const sn = S.opt.onlyExpSnap;
+      // the mode is a preset: an object whose eye was toggled by hand meanwhile keeps its own state
+      for (const b of S.model.bodies) if (b.id in sn.b && (b.visible === sn.b[b.id][1] || !Array.isArray(sn.b[b.id]))) b.visible = Array.isArray(sn.b[b.id]) ? sn.b[b.id][0] : sn.b[b.id];
+      for (const r of S.model.regions) if (r.id in sn.r && (r.visible === sn.r[r.id][1] || !Array.isArray(sn.r[r.id]))) r.visible = Array.isArray(sn.r[r.id]) ? sn.r[r.id][0] : sn.r[r.id];
+      delete S.opt.onlyExpSnap;
+    }
+    S.opt.onlyExp = !!on;
+    APP.changed({ tree: true });
+  };
+  APP.warnings = () => {
+    const w = FK.validate(APP.expModel(), APP.xbody, { transform: !!S.opt.inpTransform, maxParen: APP.maxParen(), maxZones: APP.maxZones(), noNegParen: S.opt.inpNoNeg !== false }), long = APP.inpText().split('\n').filter(l => l.length > 132).length;
+    if (APP.exportCs()) w.unshift(`INP written in coordinate system "${APP.csysLabel(APP.exportCs())}" (export frame)`);
+    if (long) w.push(`${long} line(s) longer than 132 columns (CG limit)`);
+    for (const r of S.model.regions) { if (r.noExport) continue; const c = APP.regionCache && APP.regionCache.get(r.id); if (c && c.diag && c.diag.length) w.push(`Region "${r.name}" is empty: ${String(c.diag[0].text).split(/\.\s+(?=[A-Z+\-(])/)[0]}`); }
+    for (const b of APP.unusedBodies()) w.push(`${b.type === 'RAW' ? b.rawType : b.type} "${b.name}" is not used by any exported region`);
+    for (const c of APP.csysUnused()) w.push(`Coordinate system "${c.name}" is not used by any exported body`);
+    for (const r of S.model.regions) { if (r.noExport) continue; const c = APP.regionCache && APP.regionCache.get(r.id); if (c && c.quality) for (const q of c.quality) w.push(`Region "${r.name}" ${q.text}`); }
+    return w;
+  };
+})();

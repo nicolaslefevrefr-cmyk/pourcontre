@@ -1,0 +1,1002 @@
+/* scene.js — three.js scene, camera, body/region synchronisation, picking */
+(function () {
+  'use strict';
+  const APP = window.APP, S = APP.S, V = FK.V, fmt = FK.fmt;
+  const canvas = document.getElementById('gl');
+  const labelsEl = document.getElementById('labels');
+
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  renderer.setClearColor(0x000000, 0);
+  const scene = new THREE.Scene();
+  const FOV = 35;
+  const pcam = new THREE.PerspectiveCamera(FOV, 1, 0.1, 1000), ocam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 1000);
+  pcam.up.set(0, 0, 1); ocam.up.set(0, 0, 1);
+  let camera = pcam, aspect = 1;
+  scene.add(pcam, ocam);
+  scene.add(new THREE.HemisphereLight(0xffffff, 0xaab4c2, 0.85));
+  const headLight = new THREE.DirectionalLight(0xffffff, 0.55);
+  headLight.position.set(0.4, 0.6, 1);
+  camera.add(headLight);
+
+  const gStl = new THREE.Group(), gBody = new THREE.Group(), gRegion = new THREE.Group(),
+    gMeasure = new THREE.Group(), gCsys = new THREE.Group(), gFeat = new THREE.Group(), gDev = new THREE.Group(), gChk = new THREE.Group(), gPcs = new THREE.Group(), gSel = new THREE.Group(), gHover = new THREE.Group(), gPend = new THREE.Group(), gCut = new THREE.Group();
+  const gParts = new THREE.Group();
+  scene.add(gParts, gStl, gBody, gRegion, gMeasure, gCsys, gPend, gFeat, gDev, gChk, gPcs, gSel, gHover, gCut);
+  let axes = null;
+
+  let needRender = true;
+  APP.requestRender = () => { needRender = true; };
+
+  /* ---------- Orbit camera (Z up) ---------- */
+  /* Orientation stored as a quaternion: no elevation clamp, so the view can be rotated indefinitely in any direction. */
+  const Zaxis = new THREE.Vector3(0, 0, 1), Xaxis = new THREE.Vector3(1, 0, 0);
+  const qAzEl = (az, el) => {
+    const ce = Math.cos(el), eye = new THREE.Vector3(ce * Math.cos(az), ce * Math.sin(az), Math.sin(el));
+    const m = new THREE.Matrix4().lookAt(eye, new THREE.Vector3(), Zaxis);
+    return new THREE.Quaternion().setFromRotationMatrix(m);
+  };
+  const cam = { target: new THREE.Vector3(0, 0, 0), q: qAzEl(-0.9, 0.5), dist: 300 };
+  APP.cam = cam;
+  let sceneR = 100;
+  const world = { r: 100, c: new THREE.Vector3() };           // radius / centre of everything that exists (not only what is shown): clipping planes must cover it
+  function applyCam() {
+    cam.q.normalize();
+    camera.quaternion.copy(cam.q);
+    camera.position.copy(cam.target).addScaledVector(new THREE.Vector3(0, 0, 1).applyQuaternion(cam.q), cam.dist);
+    camera.updateMatrixWorld(true);
+    updateClip();
+    needRender = true;
+  }
+  function updateClip(onlyDepth) {
+    // clipping planes: far reaches the farthest object whatever the zoom / pan / fit
+    const R = Math.max(sceneR, world.r), far = cam.dist + cam.target.distanceTo(world.c) + 2 * R + 10;
+    if (camera.isOrthographicCamera) {
+      // same apparent size as the perspective view at the pivot; objects behind the camera plane stay visible
+      const hh = cam.dist * Math.tan(FOV * Math.PI / 360);
+      if (!onlyDepth) { camera.left = -hh * aspect; camera.right = hh * aspect; camera.top = hh; camera.bottom = -hh; }
+      camera.near = -(R * 4 + cam.target.distanceTo(world.c) + 10);
+    } else camera.near = Math.max(0.001, cam.dist * 0.01);
+    camera.far = far;
+    camera.updateProjectionMatrix();
+  }
+  /** 'persp' | 'ortho' */
+  APP.setProjection = function (mode) {
+    const next = mode === 'ortho' ? ocam : pcam;
+    S.opt.proj = mode === 'ortho' ? 'ortho' : 'persp';
+    if (next !== camera) { camera.remove(headLight); camera = next; camera.add(headLight); }
+    applyCam();
+  };
+  Object.defineProperty(APP, 'camera', { get: () => camera });
+  /** Bounding box of what is currently displayed (visible meshes, bodies, regions); falls back to the render zone. */
+  const shown = (it) => !!it.visible;       // every object follows its own visibility toggle, exported or not
+  APP.visibleBox = function () {
+    const sb = [], bodies = [];
+    for (const m of S.stls) if (m.visible && m.stats && m.stats.bbox) sb.push(m.stats.bbox);
+    for (const b of S.model.bodies) if (shown(b) && b.type !== 'RAW' && !FK.isPlaneType(b.type) && !FK.isInfiniteType(b.type)) bodies.push(APP.wbody(b));
+    for (const r of S.model.regions) { const c = regC.get(r.id); if (shown(r) && c && c.bbox) sb.push(c.bbox); }
+    if (!sb.length && !bodies.length) return S.W;
+    return FK.computeWorldBox(sb, bodies, 0);
+  };
+  APP.fit = function () {
+    const W = APP.visibleBox(); if (!W) return;
+    const c = FK.boxCenter(W), r = Math.max(FK.boxDiag(W) / 2, 1);
+    sceneR = r;
+    cam.target.set(c[0], c[1], c[2]);
+    cam.dist = r / Math.sin(FOV * Math.PI / 360) * 1.05;
+    applyCam();
+  };
+  /** Look along a world direction (camera placed on the +dir side, looking at the pivot). Looking again along the same direction flips to the opposite side. */
+  APP.viewAlong = function (dir, flipIfSame) {
+    let d = new THREE.Vector3(dir[0], dir[1], dir[2]).normalize();
+    const cur = new THREE.Vector3(0, 0, 1).applyQuaternion(cam.q);
+    if (flipIfSame && cur.dot(d) > 0.9995) d.negate();
+    const up = Math.abs(d.z) > 0.99 ? new THREE.Vector3(0, 1, 0) : Zaxis;
+    cam.q = new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().lookAt(d, new THREE.Vector3(), up));
+    applyCam();
+  };
+  APP.viewDir = () => { const v = new THREE.Vector3(0, 0, 1).applyQuaternion(cam.q); return [v.x, v.y, v.z]; };
+  APP.setView = function (v) {
+    if (v === 'fit') return APP.fit();
+    if (v === 'flip') { const d = APP.viewDir(); return APP.viewAlong([-d[0], -d[1], -d[2]]); }
+    if (v === 'iso') cam.q = qAzEl(-0.785, 0.6);
+    else if (v === 'top') return APP.viewAlong([0, 0, 1]);
+    else if (v === 'front') return APP.viewAlong([0, -1, 0]);
+    else if (v === 'side') return APP.viewAlong([1, 0, 0]);
+    applyCam();
+  };
+
+  function resize() {
+    const vp = canvas.parentElement;
+    const w = Math.max(vp.clientWidth, 1), h = Math.max(vp.clientHeight, 1);
+    renderer.setSize(w, h, false);
+    aspect = w / h; pcam.aspect = aspect; applyCam();
+  }
+  new ResizeObserver(resize).observe(canvas.parentElement);
+
+  /* ---------- Pointers ---------- */
+  const ptrs = new Map();
+  let gesture = null, pinch = null;
+  function panBy(dx, dy) {
+    const h = canvas.clientHeight || 1;
+    const k = 2 * cam.dist * Math.tan(FOV * Math.PI / 360) / h;
+    const right = new THREE.Vector3(1, 0, 0).applyQuaternion(cam.q);
+    const up = new THREE.Vector3(0, 1, 0).applyQuaternion(cam.q);
+    cam.target.addScaledVector(right, -dx * k).addScaledVector(up, dy * k);
+  }
+  canvas.addEventListener('contextmenu', e => e.preventDefault());
+  canvas.addEventListener('pointerdown', e => {
+    canvas.setPointerCapture(e.pointerId);
+    ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (ptrs.size === 1) {
+      gesture = { mode: (e.button === 2 || e.button === 1 || e.shiftKey) ? 'pan' : 'rotate', moved: 0, btn: e.button, t: performance.now(), sx: e.clientX, sy: e.clientY };
+    } else if (ptrs.size === 2) {
+      const [a, b] = Array.from(ptrs.values());
+      pinch = { d: Math.hypot(a.x - b.x, a.y - b.y), cx: (a.x + b.x) / 2, cy: (a.y + b.y) / 2 };
+      gesture = { mode: 'pinch', moved: 99, btn: 0, t: 0 };
+    }
+    if (APP.hooks.leave) APP.hooks.leave();
+  });
+  canvas.addEventListener('pointermove', e => {
+    const p = ptrs.get(e.pointerId);
+    if (!p) { if (e.pointerType === 'mouse' && APP.hooks.hover) APP.hooks.hover(e.clientX, e.clientY); return; }
+    const dx = e.clientX - p.x, dy = e.clientY - p.y;
+    p.x = e.clientX; p.y = e.clientY;
+    if (!gesture) return;
+    if (gesture.mode === 'pinch' && ptrs.size >= 2) {
+      const [a, b] = Array.from(ptrs.values());
+      const d = Math.hypot(a.x - b.x, a.y - b.y), cx = (a.x + b.x) / 2, cy = (a.y + b.y) / 2;
+      if (pinch && pinch.d > 0 && d > 0) cam.dist = Math.max(0.01, cam.dist * pinch.d / d);
+      if (pinch) panBy(cx - pinch.cx, cy - pinch.cy);
+      pinch = { d, cx, cy }; applyCam(); return;
+    }
+    gesture.moved += Math.abs(dx) + Math.abs(dy);
+    if (gesture.moved < 6 && gesture.mode !== 'pinch') return;
+    if (gesture.mode === 'rotate') {
+      // CAD-style trackball: horizontal drag turns about the screen's vertical axis, vertical drag about the screen's horizontal axis (no limit)
+      const qy = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), -dx * 0.008 * (S.opt.invX ? -1 : 1));
+      const qp = new THREE.Quaternion().setFromAxisAngle(Xaxis, -dy * 0.008 * (S.opt.invY ? -1 : 1));
+      cam.q = cam.q.multiply(qy).multiply(qp); applyCam();
+    }
+    else if (gesture.mode === 'pan') { panBy(dx, dy); applyCam(); }
+  });
+  function endPtr(e) {
+    const had = ptrs.delete(e.pointerId);
+    if (!had || !gesture) return;
+    if (ptrs.size === 0) {
+      const g = gesture; gesture = null; pinch = null;
+      if (e.type === 'pointerup' && g.mode !== 'pinch' && g.moved < 6 && g.btn === 0 && performance.now() - g.t < 700) {
+        if (APP.hooks.click) APP.hooks.click(e.clientX, e.clientY);
+      }
+    } else if (ptrs.size === 1) { pinch = null; gesture = { mode: 'pinch', moved: 99, btn: 0, t: 0 }; }
+  }
+  canvas.addEventListener('pointerup', endPtr);
+  canvas.addEventListener('pointercancel', endPtr);
+  canvas.addEventListener('pointerleave', () => { if (APP.hooks.leave) APP.hooks.leave(); });
+  // double-click: the clicked point becomes the new centre of rotation
+  canvas.addEventListener('dblclick', e => {
+    const hit = APP.raycast(e.clientX, e.clientY);
+    if (!hit) return;
+    cam.target.set(hit.point.x, hit.point.y, hit.point.z);
+    applyCam();
+    if (APP.toast) APP.toast('Rotation centre: ' + [hit.point.x, hit.point.y, hit.point.z].map(v => fmt(v, 4)).join(', ') + ' cm');
+  });
+  canvas.addEventListener('wheel', e => {
+    e.preventDefault();
+    let f = Math.exp(e.deltaY * (e.deltaMode === 1 ? 0.05 : 0.0015));
+    if (cam.dist * f < 0.005) f = 0.005 / cam.dist;
+    // zoom towards the point under the cursor (not only towards the rotation centre): the surface you look at stays pickable
+    const hit = S.opt.zoomCursor !== false ? APP.raycast(e.clientX, e.clientY) : null;
+    if (hit) cam.target.set(hit.point.x + f * (cam.target.x - hit.point.x), hit.point.y + f * (cam.target.y - hit.point.y), hit.point.z + f * (cam.target.z - hit.point.z));
+    cam.dist *= f;
+    applyCam();
+  }, { passive: false });
+
+  /* ---------- Material / geometry helpers ---------- */
+  function disposeObj(o) {
+    if (!o) return;
+    o.traverse(n => {
+      if (n.geometry) n.geometry.dispose();
+      if (n.material) (Array.isArray(n.material) ? n.material : [n.material]).forEach(m => { if (m.map) m.map.dispose(); m.dispose(); });
+    });
+    if (o.parent) o.parent.remove(o);
+  }
+  function darker(hex, k) { return new THREE.Color(hex).multiplyScalar(k); }
+  /** Edge lines of a region mesh. Like THREE.EdgesGeometry (angle threshold), but an edge that only one triangle owns because of a T-junction
+   *  (the neighbour face is split differently) is NOT drawn when a coplanar triangle covers it: this removes the radial "fan" lines that
+   *  the CSG triangulation leaves on flat and curved faces. True open boundaries and real creases are still drawn. */
+  function edgesSmart(g, thrDeg) {
+    const pos = g.attributes.position.array, topo = FK.buildTopology(pos), nT = topo.nTri, cosT = Math.cos(thrDeg * Math.PI / 180);
+    const em = new Map(), nrm = topo.nrm, vp = topo.vpos, vid = topo.vid;
+    for (let t = 0; t < nT; t++) for (let k = 0; k < 3; k++) {
+      const a = vid[t * 3 + k], b = vid[t * 3 + (k + 1) % 3]; if (a === b) continue;
+      const key = a < b ? a * topo.nV + b : b * topo.nV + a; let e = em.get(key);
+      if (!e) em.set(key, e = { a, b, ts: [] }); e.ts.push(t);
+    }
+    const out = [], un = [], push = (a, b) => out.push(vp[a * 3], vp[a * 3 + 1], vp[a * 3 + 2], vp[b * 3], vp[b * 3 + 1], vp[b * 3 + 2]);
+    const dot = (t, u) => nrm[t * 3] * nrm[u * 3] + nrm[t * 3 + 1] * nrm[u * 3 + 1] + nrm[t * 3 + 2] * nrm[u * 3 + 2];
+    for (const e of em.values()) { if (e.ts.length >= 2) { if (dot(e.ts[0], e.ts[1]) < cosT) push(e.a, e.b); } else un.push(e); }
+    const st = FK.meshStats(pos), diag = st.bbox ? FK.boxDiag(st.bbox) : 1, eps = diag * 1e-5;
+    const test = un.length * nT <= 6e7;
+    for (const e of un) {
+      let covered = false;
+      if (test) {
+        const t = e.ts[0], m = [(vp[e.a * 3] + vp[e.b * 3]) / 2, (vp[e.a * 3 + 1] + vp[e.b * 3 + 1]) / 2, (vp[e.a * 3 + 2] + vp[e.b * 3 + 2]) / 2];
+        for (let u = 0; u < nT && !covered; u++) {
+          if (u === t || dot(t, u) < 0.999) continue;
+          const o = u * 9, nx = nrm[u * 3], ny = nrm[u * 3 + 1], nz = nrm[u * 3 + 2];
+          if (Math.abs(nx * (m[0] - pos[o]) + ny * (m[1] - pos[o + 1]) + nz * (m[2] - pos[o + 2])) > eps) continue;
+          // point in triangle (tolerant): the three sub-areas must have the orientation of the normal
+          let inside = true;
+          for (let k = 0; k < 3 && inside; k++) {
+            const p = o + k * 3, q = o + ((k + 1) % 3) * 3, ex = pos[q] - pos[p], ey = pos[q + 1] - pos[p + 1], ez = pos[q + 2] - pos[p + 2];
+            const wx = m[0] - pos[p], wy = m[1] - pos[p + 1], wz = m[2] - pos[p + 2];
+            const c = (ey * wz - ez * wy) * nx + (ez * wx - ex * wz) * ny + (ex * wy - ey * wx) * nz;
+            if (c < -eps * Math.hypot(ex, ey, ez)) inside = false;
+          }
+          if (inside) covered = true;
+        }
+      }
+      if (!covered) push(e.a, e.b);
+    }
+    const geo = new THREE.BufferGeometry(); geo.setAttribute('position', new THREE.Float32BufferAttribute(out, 3)); return geo;
+  }
+  function makeSolidGroup(positions, colorHex, opacity, kind, id) {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    g.computeVertexNormals();
+    const mat = new THREE.MeshPhongMaterial({ color: colorHex, side: THREE.DoubleSide, transparent: true, opacity, depthWrite: false, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1, shininess: 25 });
+    const mesh = new THREE.Mesh(g, mat);
+    mesh.userData = { kind, id };
+    const lines = new THREE.LineSegments(kind === 'region' ? edgesSmart(g, 28) : new THREE.EdgesGeometry(g, 28), new THREE.LineBasicMaterial({ color: darker(colorHex, 0.55) }));
+    lines.raycast = () => {};
+    const grp = new THREE.Group(); grp.add(mesh, lines);
+    return { group: grp, mesh, lines };
+  }
+
+  /* ---------- STL ---------- */
+  const UNIT = { mm: 0.1, cm: 1, m: 100, in: 2.54 };
+  APP.UNIT = UNIT;
+  APP.buildStl = function (stl) {
+    if (stl.group) { disposeObj(stl.group); stl.group = null; stl.mesh = null; }
+    const f = UNIT[stl.unit] || 0.1, raw = stl.raw, n = raw.length;
+    const pos = new Float32Array(n);
+    for (let i = 0; i < n; i += 3) { pos[i] = raw[i] * f + stl.offset[0]; pos[i + 1] = raw[i + 1] * f + stl.offset[1]; pos[i + 2] = raw[i + 2] * f + stl.offset[2]; }
+    const mt = FK.composeSteps(stl.steps);
+    if (mt) for (let i = 0; i < n; i += 3) { const X = pos[i], Y = pos[i + 1], Z = pos[i + 2]; pos[i] = mt[0] * X + mt[1] * Y + mt[2] * Z + mt[3]; pos[i + 1] = mt[4] * X + mt[5] * Y + mt[6] * Z + mt[7]; pos[i + 2] = mt[8] * X + mt[9] * Y + mt[10] * Z + mt[11]; }
+    stl.positions = pos;
+    stl.stats = FK.meshStats(pos);
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    g.computeVertexNormals(); g.computeBoundingSphere(); g.computeBoundingBox();
+    const mat = new THREE.MeshPhongMaterial({ color: stl.color, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1, shininess: 30 });
+    const mesh = new THREE.Mesh(g, mat);
+    mesh.userData = { kind: 'stl', id: stl.id };
+    const grp = new THREE.Group(); grp.add(mesh);
+    if (stl.edges && stl.stats.count <= 120000) {
+      const lines = new THREE.LineSegments(new THREE.EdgesGeometry(g, 30), new THREE.LineBasicMaterial({ color: 0x39434f }));
+      lines.raycast = () => {}; grp.add(lines);
+    }
+    stl.group = grp; stl.mesh = mesh;
+    gStl.add(grp);
+  };
+  APP.hooks.disposeStl = function (stl) { if (stl.group) disposeObj(stl.group); stl.group = null; stl.mesh = null; needRender = true; };
+
+  /* ---------- Body / region synchronisation ---------- */
+  const bodyC = new Map(), regC = new Map();
+  APP.bodyCache = bodyC; APP.regionCache = regC;
+  let lastWsig = '';
+
+  function planeVisual(b, W, wb) {
+    const pp = FK.planePolygon(wb, W);
+    if (!pp) return null;
+    const v = pp.verts, pos = [];
+    for (let i = 1; i < v.length - 1; i++) pos.push(v[0][0], v[0][1], v[0][2], v[i][0], v[i][1], v[i][2], v[i + 1][0], v[i + 1][1], v[i + 1][2]);
+    const grp = new THREE.Group();
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pos), 3));
+    g.computeVertexNormals();
+    const mat = new THREE.MeshBasicMaterial({ color: b.color, side: THREE.DoubleSide, transparent: true, opacity: b.opacity, depthWrite: false, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 });
+    const mesh = new THREE.Mesh(g, mat); mesh.userData = { kind: 'body', id: b.id };
+    const lg = new THREE.BufferGeometry().setFromPoints(v.map(p => new THREE.Vector3(p[0], p[1], p[2])));
+    const lines = new THREE.LineLoop(lg, new THREE.LineBasicMaterial({ color: darker(b.color, 0.55) }));
+    lines.raycast = () => {};
+    const len = Math.max(FK.boxDiag(W) * 0.06, 1);
+        const origin = V.add(pp.center, V.mul(pp.normal, 0));
+    const arrow = new THREE.ArrowHelper(new THREE.Vector3(pp.normal[0], pp.normal[1], pp.normal[2]), new THREE.Vector3(origin[0], origin[1], origin[2]), len, darker(b.color, 0.55).getHex(), len * 0.3, len * 0.15);
+    arrow.traverse(o => { o.raycast = () => {}; });
+    // arrow at the plane point V if inside the zone, otherwise at the projected centre
+    grp.add(mesh, lines, arrow);
+    return { group: grp, mesh, lines, arrow };
+  }
+
+  APP.sync = function () {
+    const stlBoxes = S.stls.filter(s => s.stats && s.stats.bbox).map(s => s.stats.bbox);
+    const wbodies = new Map(S.model.bodies.map(b => [b.id, APP.wbody(b)]));
+    const W = S.W = FK.computeWorldBox(stlBoxes, Array.from(wbodies.values()), S.opt.margin);
+    FK.resolution = S.opt.res || 1;
+    const wsig = W.min.concat(W.max).map(x => x.toFixed(3)).join(',') + '|r' + FK.resolution;
+    const byName = new Map();
+    for (const b of S.model.bodies) if (!byName.has(b.name)) byName.set(b.name, b);
+    // Zone of the automatic envelope boxes (AIR / BLCKBODY): the zone W ignores very large bodies, so they would be cut to it and a margin change would show nothing
+    let Wenv = W;
+    { const eb = S.model.bodies.filter(b => b.auto).map(b => FK.bodyBBox(wbodies.get(b.id))).filter(Boolean);
+      if (eb.length) { let lo = W.min.slice(), hi = W.max.slice(); for (const x of eb) for (let k = 0; k < 3; k++) { lo[k] = Math.min(lo[k], x.min[k]); hi[k] = Math.max(hi[k], x.max[k]); } const pad = FK.boxDiag({ min: lo, max: hi }) * 0.01; Wenv = { min: lo.map(v => v - pad), max: hi.map(v => v + pad) }; } }
+    const wsigE = Wenv === W ? wsig : Wenv.min.concat(Wenv.max).map(x => x.toFixed(3)).join(',') + '|r' + FK.resolution;
+    { const wc = FK.boxCenter(Wenv); world.r = Math.max(FK.boxDiag(Wenv) / 2, 1); world.c.set(wc[0], wc[1], wc[2]); updateClip(true); needRender = true; }
+    if (wsig !== lastWsig) {
+      lastWsig = wsig;
+      sceneR = Math.max(FK.boxDiag(W) / 2, 1);
+      if (axes) disposeObj(axes);
+      axes = new THREE.AxesHelper(Math.max(FK.boxDiag(W) * 0.06, 1));
+      axes.material.depthTest = false; axes.renderOrder = 5;
+      scene.add(axes);
+    }
+    if (axes) axes.visible = !!S.opt.axes;
+
+    // corps
+    const seenB = new Set();
+    for (const b of S.model.bodies) {
+      seenB.add(b.id);
+      const wb = wbodies.get(b.id);
+      const WB = b.auto ? Wenv : W;
+      const sig = (b.auto ? wsigE : wsig) + '|' + wb.type + '|' + wb.p.join(',') + (FK.isPlaneType(wb.type) ? '|' + b.color : '');
+      let c = bodyC.get(b.id);
+      if (c && c.sig === sig && c.colorKey === b.color) continue;
+      if (c && c.group) disposeObj(c.group);
+      c = { sig, colorKey: b.color, polys: undefined, group: null, mesh: null, lines: null };
+      bodyC.set(b.id, c);
+      try {
+        if (b.type === 'RAW') { /* not displayed */ }
+        else if (FK.isPlaneType(wb.type)) {
+          const pv = planeVisual(b, WB, wb);
+          if (pv) { c.group = pv.group; c.mesh = pv.mesh; c.lines = pv.lines; }
+        } else {
+          c.polys = FK.bodyPolys(wb, WB);
+          if (c.polys && c.polys.length) {
+            const o = makeSolidGroup(FK.polysToPositions(c.polys), b.color, b.opacity, 'body', b.id);
+            c.group = o.group; c.mesh = o.mesh; c.lines = o.lines;
+          }
+        }
+      } catch (e) { c.err = e.message; }
+      if (c.group) gBody.add(c.group);
+    }
+    for (const [id, c] of bodyC) if (!seenB.has(id)) { if (c.group) disposeObj(c.group); bodyC.delete(id); }
+
+    // regions
+    const polysOf = (b) => {
+      const c = bodyC.get(b.id); if (!c) return null;
+      if (c.polys === undefined) { try { c.polys = FK.bodyPolys(wbodies.get(b.id), W); } catch (e) { c.polys = null; } }
+      return c.polys;
+    };
+    const ctx = { body: (n) => { const b = byName.get(n); return b ? polysOf(b) : null; }, world: () => FK.boxPolys(W) };
+    const polysOfE = (b) => {                                  // same bodies, clipped to the larger zone of the envelope regions
+      if (b.auto) return polysOf(b);
+      const c = bodyC.get(b.id); if (!c) return null;
+      if (c.polysE === undefined || c.sigE !== wsigE) { try { c.polysE = FK.bodyPolys(wbodies.get(b.id), Wenv); } catch (e) { c.polysE = null; } c.sigE = wsigE; }
+      return c.polysE;
+    };
+    const ctxE = { body: (n) => { const b = byName.get(n); return b ? polysOfE(b) : null; }, world: () => FK.boxPolys(Wenv) };
+    const seenR = new Set();
+    for (const r of S.model.regions) {
+      seenR.add(r.id);
+      const needed = r.visible || (S.sel && S.sel.t === 'region' && S.sel.id === r.id);
+      let c = regC.get(r.id);
+      if (!c) { c = { sig: null, group: null, err: null }; regC.set(r.id, c); }
+      if (!needed) continue;
+      let ast = null, names = [];
+      try { ast = FK.parseExpr(r.expr); names = Array.from(FK.exprNames(ast)); } catch (e) { c.err = e.message; if (c.group) { disposeObj(c.group); c.group = null; } c.sig = 'err:' + r.expr; continue; }
+      const envR = r.auto === 'air' || r.auto === 'bb', WZ = envR ? Wenv : W, cx = envR ? ctxE : ctx;
+      const sig = (envR ? wsigE : wsig) + '|' + r.expr + '|' + r.color + '|' + names.map(n => { const b = byName.get(n); if (!b) return '?'; const w = wbodies.get(b.id); return w.type + w.p.join(','); }).join(';');
+      if (c.sig === sig) continue;
+      if (c.group) { disposeObj(c.group); c.group = null; }
+      c.sig = sig; c.err = null; c.vol = null; c.area = null; c.bbox = null; c.polys = null;
+      try {
+        const polys = FK.evalExpr(ast, cx);
+        c.polys = polys;
+        c.vol = FK.polysVolume(polys); c.area = FK.polysArea(polys); c.bbox = FK.polysBBox(polys);
+        c.diag = null; c.quality = null;
+        if (polys.length && c.vol >= 1e-9) { try { c.quality = FK.checkRegionQuality(ast, { W: WZ, polys, vol: c.vol, wbody: (n) => { const b = byName.get(n); return b ? wbodies.get(b.id) : null; } }); } catch (e) { c.quality = null; } }
+        if (!polys.length || c.vol < 1e-9) {
+          try { c.diag = FK.diagnoseRegion(ast, { W: WZ, world: cx.world, body: cx.body, wbody: (n) => { const b = byName.get(n); return b ? wbodies.get(b.id) : null; } }); } catch (e) { c.diag = null; }
+        }
+        if (polys.length) {
+          const o = makeSolidGroup(FK.polysToPositions(polys), r.color, r.opacity, 'region', r.id);
+          c.group = o.group; c.mesh = o.mesh; c.lines = o.lines; gRegion.add(c.group);
+        }
+      } catch (e) { c.err = e.message; }
+    }
+    for (const [id, c] of regC) if (!seenR.has(id)) { if (c.group) disposeObj(c.group); regC.delete(id); }
+    APP.applyStyles();
+  };
+
+  // Evaluate a region on demand (even hidden): { ast, polys, bbox, vol, diag, W } or { error }
+  APP.evalRegionNow = function (r) {
+    let ast;
+    try { ast = FK.parseExpr(r.expr); } catch (e) { return { error: e.message }; }
+    const stlBoxes = S.stls.filter(s => s.stats && s.stats.bbox).map(s => s.stats.bbox);
+    const wbodies = new Map(S.model.bodies.map(b => [b.id, APP.wbody(b)]));
+    const W = FK.computeWorldBox(stlBoxes, Array.from(wbodies.values()), S.opt.margin);
+    const byName = new Map();
+    for (const b of S.model.bodies) if (!byName.has(b.name)) byName.set(b.name, b);
+    const cache = new Map();
+    const polysOf = (b) => {
+      if (!cache.has(b.id)) { let p = null; try { p = FK.bodyPolys(wbodies.get(b.id), W); } catch (e) { p = null; } cache.set(b.id, p); }
+      return cache.get(b.id);
+    };
+    const ctx = { body: (n) => { const b = byName.get(n); return b ? polysOf(b) : null; }, world: () => FK.boxPolys(W) };
+    try {
+      const polys = FK.evalExpr(ast, ctx);
+      const vol = FK.polysVolume(polys), bbox = polys.length ? FK.polysBBox(polys) : null;
+      let diag = null;
+      if (!polys.length || vol < 1e-9) {
+        try { diag = FK.diagnoseRegion(ast, { W, world: ctx.world, body: ctx.body, wbody: (n) => { const b = byName.get(n); return b ? wbodies.get(b.id) : null; } }); } catch (e) { diag = null; }
+      }
+      let quality = null;
+      if (polys.length && vol >= 1e-9) { try { quality = FK.checkRegionQuality(ast, { W, polys, vol, wbody: (n) => { const b = byName.get(n); return b ? wbodies.get(b.id) : null; } }); } catch (e) { quality = null; } }
+      return { ast, polys, bbox, vol, diag, W, quality };
+    } catch (e) { return { error: e.message }; }
+  };
+
+  /* ---------- Temporary preview of a detected feature (not part of the model until validated) ---------- */
+  /** Deviation map: indexed triangles (points, tri) with a colour per point (Float32Array, 3 per point). null clears it. */
+  APP.setDeviationOverlay = function (o) {
+    for (const c of gDev.children.slice()) { gDev.remove(c); disposeObj(c); }
+    needRender = true;
+    if (!o) return;
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(o.points, 3)); g.setAttribute('color', new THREE.BufferAttribute(o.colors, 3));
+    g.setIndex(new THREE.BufferAttribute(o.tri, 1));
+    const m = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -4 }));
+    m.raycast = () => {}; m.renderOrder = 6; gDev.add(m);
+  };
+  /** Separate pieces of a region, one colour each, + a red spot where two of them are closest. pieces: [{ polys, color }], spot: { p, q, d } | null. null clears. */
+  APP.setPieceOverlay = function (pieces, spot) {
+    for (const c of gPcs.children.slice()) { gPcs.remove(c); disposeObj(c); }
+    needRender = true;
+    if (!pieces) return;
+    pieces.forEach(pc => {
+      const pos = FK.polysToPositions(pc.polys), g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+      const m = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: pc.color, transparent: true, opacity: 0.6, side: THREE.DoubleSide, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -3 }));
+      m.raycast = () => {}; m.renderOrder = 6; gPcs.add(m);
+    });
+    if (spot) { const mid = V.mul(V.add(spot.p, spot.q), 0.5); gPcs.add(markers([mid], 0xff0000, 18)); if (spot.d > 1e-9) gPcs.add(polyline([spot.p, spot.q], 0xff0000)); }
+  };
+  /* ---------- Object names drawn in the viewport ---------- */
+  const olabels = document.createElement('div'); olabels.id = 'olabels'; labelsEl.parentElement.appendChild(olabels);
+  let nameItems = [];
+  APP.refreshNames = function () {
+    olabels.innerHTML = ''; nameItems = [];
+    const mode = S.opt.names || 'off'; if (mode === 'off') return;
+    const add = (name, color, bb) => {
+      if (!bb || nameItems.length >= 160) return;
+      const el = document.createElement('div'); el.className = 'olab'; el.textContent = name;
+      el.style.color = '#' + darker(color, 0.7).getHexString(); olabels.appendChild(el);
+      nameItems.push({ el, c: FK.boxCenter(bb), color });
+    };
+    if (mode === 'bodies' || mode === 'all') for (const b of S.model.bodies) { if (!shown(b) || b.type === 'RAW') continue;
+      let bb = null;
+      if (FK.isPlaneType(b.type)) { const c = bodyC.get(b.id); if (c && c.group) { const bx = new THREE.Box3().setFromObject(c.group); if (!bx.isEmpty()) bb = { min: bx.min.toArray(), max: bx.max.toArray() }; } }
+      else { try { bb = FK.bodyBBox(APP.wbody(b)); } catch (e) { bb = null; } if (bb && ![...bb.min, ...bb.max].every(Number.isFinite)) bb = null; }
+      add(b.name, b.color, bb); }
+    if (mode === 'regions' || mode === 'all') for (const r of S.model.regions) {
+      if (!shown(r)) continue; const c = regC.get(r.id); if (!c || !c.polys || !c.polys.length) continue;
+      let mn = [Infinity, Infinity, Infinity], mx = [-Infinity, -Infinity, -Infinity];
+      for (const pl of c.polys) for (const v of pl.v) for (let k = 0; k < 3; k++) { if (v[k] < mn[k]) mn[k] = v[k]; if (v[k] > mx[k]) mx[k] = v[k]; }
+      add(r.name, r.color, { min: mn, max: mx });
+    }
+    if (mode === 'all') for (const m of S.stls) if (m.visible && m.stats && m.stats.bbox) add(m.name, m.color, m.stats.bbox);
+  };
+  function placeNames() {
+    if (!nameItems.length) return;
+    const cw = canvas.clientWidth, ch = canvas.clientHeight, placed = [];
+    for (const it of nameItems) {
+      const v = new THREE.Vector3(it.c[0], it.c[1], it.c[2]).project(camera);
+      if (v.z > 1 || v.z < -1) { it.el.style.display = 'none'; continue; }
+      let x = (v.x + 1) / 2 * cw, y = (1 - v.y) / 2 * ch - 14; const w = it.el.textContent.length * 7 + 8;
+      for (let t = 0; t < 8; t++) { const hit = placed.find(q => Math.abs(q.x - x) < (q.w + w) / 2 && Math.abs(q.y - y) < 15); if (!hit) break; y += 15; }
+      placed.push({ x, y, w }); it.el.style.display = ''; it.el.style.left = x + 'px'; it.el.style.top = y + 'px';
+    }
+  }
+  /** Geometry-check markers: [{ centers: Float32Array (xyz…), size, color }] drawn as small cubes. null clears them. */
+  APP.setCheckMarks = function (list) {
+    for (const c of gChk.children.slice()) { gChk.remove(c); disposeObj(c); }
+    needRender = true;
+    if (!list) return;
+    for (const L of list) {
+      const n = L.centers.length / 3; if (!n) continue;
+      const im = new THREE.InstancedMesh(new THREE.BoxGeometry(L.size, L.size, L.size), new THREE.MeshBasicMaterial({ color: L.color, transparent: true, opacity: 0.55, depthWrite: false }), n);
+      const mt = new THREE.Matrix4();
+      for (let i = 0; i < n; i++) { mt.makeTranslation(L.centers[i * 3], L.centers[i * 3 + 1], L.centers[i * 3 + 2]); im.setMatrixAt(i, mt); }
+      im.raycast = () => {}; im.renderOrder = 7; gChk.add(im);
+    }
+  };
+  APP.setFeaturePreview = function (feat, positions, seeds) {
+    for (const c of gFeat.children.slice()) { gFeat.remove(c); disposeObj(c); }
+    needRender = true;
+    const tri = (tris, hex, op, off) => {
+      const pp = new Float32Array(tris.length * 9);
+      tris.forEach((t, i) => { for (let k = 0; k < 9; k++) pp[i * 9 + k] = positions[t * 9 + k]; });
+      const gg = new THREE.BufferGeometry(); gg.setAttribute('position', new THREE.BufferAttribute(pp, 3));
+      const mm = new THREE.Mesh(gg, new THREE.MeshBasicMaterial({ color: hex, side: THREE.DoubleSide, transparent: true, opacity: op, polygonOffset: true, polygonOffsetFactor: off, polygonOffsetUnits: off, depthWrite: false }));
+      mm.raycast = () => {}; gFeat.add(mm);
+    };
+    if (!feat) { if (seeds && seeds.length) tri(seeds, 0x2563eb, 0.85, -3); return; }
+    // 1. the mesh triangles the feature was recognised on
+    const pos = new Float32Array(feat.tris.length * 9);
+    feat.tris.forEach((t, i) => { for (let k = 0; k < 9; k++) pos[i * 9 + k] = positions[t * 9 + k]; });
+    const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    const m1 = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: 0xff8a00, side: THREE.DoubleSide, transparent: true, opacity: 0.6, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2, depthWrite: false }));
+    m1.raycast = () => {}; gFeat.add(m1);
+    // 2. the proposed primitive
+    try {
+      let prim = null;
+      if (feat.kind === 'plane') {
+        const r = feat.rect, pp = [];
+        for (const q of [[0, 1, 2], [0, 2, 3]]) for (const k of q) pp.push(r[k][0], r[k][1], r[k][2]);
+        const g2 = new THREE.BufferGeometry(); g2.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pp), 3));
+        const grp = new THREE.Group();
+        const me = new THREE.Mesh(g2, new THREE.MeshBasicMaterial({ color: 0x16a34a, side: THREE.DoubleSide, transparent: true, opacity: 0.25, depthWrite: false }));
+        const ln = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(r.map(q => new THREE.Vector3(q[0], q[1], q[2]))), new THREE.LineBasicMaterial({ color: 0x15803d }));
+        me.raycast = () => {}; ln.raycast = () => {}; grp.add(me, ln); prim = grp;
+      } else {
+        const st = feat.box, W = { min: st.min.map(x => x - 1), max: st.max.map(x => x + 1) };
+        let body = { type: feat.type, p: feat.p };
+        if (feat.cs) body = FK.worldBody(body, feat.cs);
+        const polys = FK.bodyPolys(body, W);
+        if (polys && polys.length) { const o = makeSolidGroup(FK.polysToPositions(polys), '#16a34a', 0.22, 'feat', 0); o.mesh.raycast = () => {}; o.lines.material.color.set(0x15803d); prim = o.group; }
+      }
+      if (prim) gFeat.add(prim);
+    } catch (e) { /* preview of the primitive is best effort */ }
+    if (seeds && seeds.length) tri(seeds, 0x2563eb, 0.9, -3);   // the triangles clicked by the user
+  };
+
+  // Wireframe mode: every facet edge (coplanar triangle diagonals are skipped), built lazily
+  function wireOf(group, mesh, on, colorHex) {
+    let w = group.userData.wire;
+    if (!on) { if (w) w.visible = false; return; }
+    if (!w) {
+      const n = mesh.geometry.attributes.position.count / 3;
+      if (n > 150000) return;
+      w = new THREE.LineSegments(new THREE.EdgesGeometry(mesh.geometry, 1), new THREE.LineBasicMaterial({ color: colorHex }));
+      w.raycast = () => {}; group.add(w); group.userData.wire = w;
+    }
+    w.visible = true; w.material.color.set(colorHex);
+  }
+  /** Removes 3D objects that no project object owns any more (they would stay on screen, hidden from neither the toggles nor the picking). Returns how many were removed. */
+  function sweepOrphans() {
+    const own = new Set();
+    for (const c of bodyC.values()) if (c.group) own.add(c.group);
+    for (const c of regC.values()) if (c.group) own.add(c.group);
+    for (const t of S.stls) if (t.group) own.add(t.group);
+    let n = 0;
+    for (const g of [gStl, gBody, gRegion]) for (const ch of g.children.slice()) if (!own.has(ch)) { disposeObj(ch); n++; }
+    return n;
+  }
+  /** Full redraw: drops every cached 3D object and every temporary overlay, then rebuilds from the model. */
+  APP.refreshView = function () {
+    S.hlId = null; S.hlSet = null; S.pick = null;
+    const orphans = sweepOrphans();
+    for (const c of bodyC.values()) if (c.group) disposeObj(c.group);
+    for (const c of regC.values()) if (c.group) disposeObj(c.group);
+    bodyC.clear(); regC.clear();
+    for (const t of S.stls) { if (t.group) { disposeObj(t.group); t.group = null; t.mesh = null; } if (t.raw && t.raw.length) APP.buildStl(t); }
+    for (const g of [gFeat, gDev, gChk, gPcs]) clearGroup(g);   // temporary overlays: they are redrawn by their own tool when needed
+    lastWsig = null;
+    if (APP.drawHighlight) { APP.drawHighlight(gSel, null); APP.drawHighlight(gHover, null, true); }
+    APP.sync(); if (APP.rebuildCsys) APP.rebuildCsys(); if (APP.rebuildMeasures) APP.rebuildMeasures(); APP.rebuildParts();
+    needRender = true;
+    return orphans;
+  };
+  APP.applyStyles = function () {
+    sweepOrphans();
+    const sel = S.sel, rm = S.opt.render || 'shaded', edgesOn = S.opt.edges !== false || rm === 'wire';
+    // global render mode: shaded (per-item opacities) · wire (edges only) · opaque (all solids at 1) · ghost (all solids very transparent)
+    // presets: 'meshop' = meshes opaque, CG objects slightly transparent · 'cgop' = the reverse; item.look = 'opaque' | 'transparent' overrides the global mode
+    const effOp = (op, plane, isSel, item, isMesh) => {
+      if (rm === 'wire') return 0;
+      const bump = isSel ? 0.15 : 0;
+      if (plane) return Math.min(1, op + bump);
+      if (item && item.look === 'opaque') return rm === 'ghost' ? Math.min(op, 0.12) : 1;
+      if (item && item.look === 'transparent') return op < 0.995 ? Math.min(1, op + bump) : 0.3;
+      if (rm === 'opaque') return 1;
+      if (rm === 'ghost') return Math.min(op, 0.12);
+      if (rm === 'meshop') return isMesh ? 1 : Math.min(0.3, op) + bump;
+      if (rm === 'cgop') return isMesh ? Math.min(0.3, op) + bump : 1;
+      return Math.min(1, op + bump);
+    };
+    const hl = (id) => S.hlId === id || !!(S.hlSet && S.hlSet.has(id));   // always a boolean: three.js hides an object only when visible === false (null / undefined would leave it drawn)
+    const style = (c, item, plane, isSel, col) => {
+      const o = effOp(item.opacity, plane, isSel, item, false), m = c.mesh.material;
+      c.group.visible = !!(shown(item) || hl(item.id));
+      c.mesh.visible = item.opacity > 0.004 || hl(item.id);
+      const bc = col || item.color;
+      m.color.set(bc); m.opacity = o;
+      const solid = o >= 0.995 && !plane; m.transparent = !solid; m.depthWrite = solid;
+      c.lines.visible = edgesOn && rm !== 'wire';
+      c.lines.material.color.set(isSel ? 0xff6a00 : darker(bc, 0.55).getHex());
+      wireOf(c.group, c.mesh, rm === 'wire' && !plane, isSel ? 0xff6a00 : darker(bc, 0.55).getHex());
+    };
+    for (const b of S.model.bodies) {
+      const c = bodyC.get(b.id); if (!c || !c.group) continue;
+      style(c, b, FK.isPlaneType(b.type), (sel && sel.t === 'body' && sel.id === b.id) || hl(b.id));
+    }
+    for (const r of S.model.regions) {
+      const c = regC.get(r.id); if (!c || !c.group) continue;
+      style(c, r, false, (sel && sel.t === 'region' && sel.id === r.id) || hl(r.id), S.opt.colorBy === 'material' ? APP.materialColor(r.mat) : null);
+    }
+    for (const s of S.stls) {
+      if (!s.group) continue;
+      const isSel = sel && sel.t === 'stl' && sel.id === s.id;
+      s.group.visible = !!s.visible;
+      const m = s.mesh.material, o = effOp(s.opacity, false, false, s, true), tr = o < 0.995;
+      m.color.set(s.color); m.opacity = o; m.transparent = tr; m.depthWrite = !tr;
+      m.emissive.setHex(isSel ? 0x1c3566 : 0x000000); m.needsUpdate = true;
+      s.mesh.visible = s.opacity > 0.004;
+      for (const ch of s.group.children) if (ch !== s.mesh && ch !== s.group.userData.wire) ch.visible = edgesOn && rm !== 'wire';
+      wireOf(s.group, s.mesh, rm === 'wire', isSel ? 0xff6a00 : 0x39434f);
+    }
+    if (axes) axes.visible = !!S.opt.axes;
+    APP.refreshNames();
+    needRender = true;
+  };
+
+  /* ---------- Measures ---------- */
+  function circleTexture() {
+    const c = document.createElement('canvas'); c.width = c.height = 64;
+    const x = c.getContext('2d');
+    x.beginPath(); x.arc(32, 32, 28, 0, Math.PI * 2); x.fillStyle = '#fff'; x.fill();
+    x.lineWidth = 6; x.strokeStyle = 'rgba(0,0,0,.55)'; x.stroke();
+    return new THREE.CanvasTexture(c);
+  }
+  const dotTex = circleTexture();
+  function markers(pts, colorHex, size) {
+    const g = new THREE.BufferGeometry().setFromPoints(pts.map(p => new THREE.Vector3(p[0], p[1], p[2])));
+    const m = new THREE.Points(g, new THREE.PointsMaterial({ color: colorHex, size: size || 11, sizeAttenuation: false, map: dotTex, alphaTest: 0.3, transparent: true, depthTest: false }));
+    m.renderOrder = 10; m.raycast = () => {};
+    return m;
+  }
+  function polyline(pts, colorHex) {
+    const g = new THREE.BufferGeometry().setFromPoints(pts.map(p => new THREE.Vector3(p[0], p[1], p[2])));
+    const l = new THREE.Line(g, new THREE.LineBasicMaterial({ color: colorHex, depthTest: false, transparent: true }));
+    l.renderOrder = 9; l.raycast = () => {};
+    return l;
+  }
+  function clearGroup(g) { while (g.children.length) disposeObj(g.children[0]); }
+  APP.fmtLen = (d) => fmt(d, 4) + ' cm';
+  APP.rebuildMeasures = function () {
+    clearGroup(gMeasure); labelsEl.innerHTML = '';
+    for (const m of S.measures) {
+      m.labelEl = null;
+      if (!m.visible) continue;
+      gMeasure.add(polyline([m.a, m.b], 0xf97316), markers([m.a, m.b], 0xf97316, 9));
+      const d = V.dist(m.a, m.b);
+      const lab = document.createElement('div'); lab.className = 'lab';
+      lab.textContent = fmt(d, 3) + ' cm';
+      labelsEl.appendChild(lab); m.labelEl = lab;
+    }
+    needRender = true;
+  };
+  APP.setPending = function (pt) {
+    clearGroup(gPend);
+    if (pt) gPend.add(markers(Array.isArray(pt[0]) ? pt : [pt], 0x16a34a, 12));
+    needRender = true;
+  };
+
+  /* ---------- Coordinate systems (csys) ---------- */
+  const clabels = document.createElement('div');
+  clabels.id = 'clabels'; labelsEl.parentElement.appendChild(clabels);
+  const csysLab = [];
+  /** Sub-objects that the INP really contains for the bodies written differently (bounding RPP + cutting planes of a rotated RPP, QUA of an oblique cylinder…): drawn when S.opt.showParts. */
+  APP.rebuildParts = function () {
+    for (const ch of gParts.children.slice()) disposeObj(ch);
+    needRender = true;
+    if (!S.opt.showParts || !S.W) return;
+    const W = S.W, ex = APP.exportCs(), mw = ex ? APP.csysWorld(ex) : null;
+    for (const [b, ps] of APP.exportParts()) {
+      if (b.visible === false || !(ps.length > 1 || (ps[0] && ps[0].type !== b.type))) continue;
+      for (const pt of ps) {
+        if (pt.mergedInto) continue;
+        try {
+          let pw = { type: pt.type, p: pt.p };
+          if (mw) { if (pt.type === 'ICC') continue; pw = FK.worldBody(pw, mw); }
+          const cut = pt.role === 'cut', col = cut ? '#e8590c' : '#1c7ed6', op = cut ? 0.22 : 0.12;
+          if (FK.isPlaneType(pw.type)) { const pv = planeVisual({ color: col, opacity: op, id: -1 }, W, pw); if (pv) { pv.mesh.raycast = () => {}; gParts.add(pv.group); } }
+          else { const polys = FK.bodyPolys(pw, W); if (polys && polys.length) { const o = makeSolidGroup(FK.polysToPositions(polys), col, op, 'part', -1); o.mesh.raycast = () => {}; gParts.add(o.group); } }
+        } catch (e) { /* a part that cannot be drawn is skipped */ }
+      }
+    }
+  };
+  APP.rebuildCsys = function () {
+    clearGroup(gCsys); clabels.innerHTML = ''; csysLab.length = 0;
+    const L = Math.max((S.W ? FK.boxDiag(S.W) : 100) * 0.07, 1);
+    const list = [{ id: 0, name: 'Global', m: FK.M.id(), visible: false, color: '#64748b' }].concat(S.model.csys.map(c => ({ id: c.id, name: c.name, m: APP.csysWorld(c.id), visible: c.visible, color: c.color })));
+    for (const c of list) {
+      const isAct = (S.model.active || 0) === c.id;
+      if (!c.visible && !(isAct && c.id)) continue;
+      const o = [c.m[3], c.m[7], c.m[11]];
+      const mk = (ax, hex) => polyline([o, FK.M.apply(c.m, ax.map(x => x * L))], hex);
+      gCsys.add(mk([1, 0, 0], 0xdc2626), mk([0, 1, 0], 0x16a34a), mk([0, 0, 1], 0x2563eb));
+      gCsys.add(markers([o], new THREE.Color(c.color).getHex(), isAct ? 9 : 6));
+      const lab = document.createElement('div'); lab.className = 'lab clab' + (isAct ? ' act' : ''); lab.textContent = c.name;
+      lab.style.color = c.color;
+      clabels.appendChild(lab); csysLab.push({ el: lab, p: o });
+    }
+    needRender = true;
+  };
+
+  /* ---------- Orientation triad (top-right) ---------- */
+  const triadEl = document.getElementById('triad');
+  const AXES = [{ n: 'X', v: [1, 0, 0], c: '#dc2626' }, { n: 'Y', v: [0, 1, 0], c: '#16a34a' }, { n: 'Z', v: [0, 0, 1], c: '#2563eb' }];
+  function updateTriad() {
+    if (!triadEl) return;
+    const inv = cam.q.clone().invert(), C = 46, L = 30, ends = [];
+    for (const a of AXES) for (const sg of [1, -1]) {
+      const v = new THREE.Vector3(a.v[0] * sg, a.v[1] * sg, a.v[2] * sg).applyQuaternion(inv);
+      ends.push({ a, sg, x: C + v.x * L, y: C - v.y * L, z: v.z });
+    }
+    ends.sort((p, q) => p.z - q.z);
+    let h = `<svg viewBox="0 0 ${2 * C} ${2 * C}"><circle cx="${C}" cy="${C}" r="${C - 2}" fill="rgba(255,255,255,.55)" stroke="rgba(0,0,0,.08)"/>`;
+    for (const e of ends) {
+      const d = `data-dir="${e.a.v.map(x => x * e.sg).join(',')}"`;
+      h += `<g class="ax" ${d}>` + (e.sg > 0
+        ? `<line x1="${C}" y1="${C}" x2="${e.x.toFixed(1)}" y2="${e.y.toFixed(1)}" stroke="${e.a.c}" stroke-width="2.5" opacity="${(0.55 + 0.45 * (e.z + 1) / 2).toFixed(2)}"/><circle cx="${e.x.toFixed(1)}" cy="${e.y.toFixed(1)}" r="9" fill="${e.a.c}"/><text x="${e.x.toFixed(1)}" y="${(e.y + 3.6).toFixed(1)}" text-anchor="middle" font-size="11" font-weight="700" fill="#fff">${e.a.n}</text>`
+        : `<circle cx="${e.x.toFixed(1)}" cy="${e.y.toFixed(1)}" r="5.5" fill="#fff" stroke="${e.a.c}" stroke-width="1.5" opacity="${(0.45 + 0.4 * (e.z + 1) / 2).toFixed(2)}"/>`) + '</g>';
+    }
+    triadEl.innerHTML = h + '</svg>';
+  }
+  if (triadEl) triadEl.addEventListener('click', e => {
+    const g = e.target.closest('.ax'); if (!g) return;
+    APP.viewAlong(g.dataset.dir.split(',').map(Number), true);
+  });
+
+  function updateLabels() {
+    updateTriad(); placeNames();
+    const cw = canvas.clientWidth, ch = canvas.clientHeight;
+    for (const l of csysLab) {
+      const v = new THREE.Vector3(l.p[0], l.p[1], l.p[2]).project(camera);
+      if (v.z > 1 || v.z < -1) { l.el.style.display = 'none'; continue; }
+      l.el.style.display = ''; l.el.style.left = ((v.x + 1) / 2 * cw) + 'px'; l.el.style.top = ((1 - v.y) / 2 * ch) + 'px';
+    }
+    if (!S.measures.length) return;
+    const w = canvas.clientWidth, h = canvas.clientHeight;
+    for (const m of S.measures) {
+      if (!m.labelEl) continue;
+      const mid = new THREE.Vector3((m.a[0] + m.b[0]) / 2, (m.a[1] + m.b[1]) / 2, (m.a[2] + m.b[2]) / 2).project(camera);
+      if (mid.z > 1 || mid.z < -1) { m.labelEl.style.display = 'none'; continue; }
+      m.labelEl.style.display = '';
+      m.labelEl.style.left = ((mid.x + 1) / 2 * w) + 'px';
+      m.labelEl.style.top = ((1 - mid.y) / 2 * h) + 'px';
+    }
+  }
+
+  /* ---------- Rays and picking ---------- */
+  const raycaster = new THREE.Raycaster();
+  const ndc = new THREE.Vector2();
+  function pickMeshes() {
+    const out = [];
+    for (const s of S.stls) if (s.mesh && s.visible && s.opacity > 0.004) out.push(s.mesh);
+    for (const b of S.model.bodies) { const c = bodyC.get(b.id); if (c && c.mesh && shown(b) && b.opacity > 0.004) out.push(c.mesh); }
+    for (const r of S.model.regions) { const c = regC.get(r.id); if (c && c.mesh && shown(r) && r.opacity > 0.004) out.push(c.mesh); }
+    return out;
+  }
+  APP.totalTris = () => pickMeshes().reduce((a, m) => a + m.geometry.attributes.position.count / 3, 0);
+  APP.raycast = function (cx, cy) {
+    const r = canvas.getBoundingClientRect();
+    camera.updateMatrixWorld(true);
+    ndc.set(((cx - r.left) / r.width) * 2 - 1, -((cy - r.top) / r.height) * 2 + 1);
+    raycaster.setFromCamera(ndc, camera);
+    const hits = backLast(raycaster.intersectObjects(pickMeshes(), false));
+    return hits.length ? hits[0] : null;
+  };
+  /** While a region is being defined (cut / pick tools) it is clickable only after everything else: its hits go to the end of the list. */
+  function backLast(hits) {
+    const id = S.pickBackRid; if (!id || hits.length < 2) return hits;
+    const isBack = (h) => h.object.userData && h.object.userData.kind === 'region' && h.object.userData.id === id;
+    return hits.filter(h => !isBack(h)).concat(hits.filter(isBack));
+  }
+  /** All entities under the cursor (one hit per mesh / body / region, nearest first). */
+  APP.raycastAll = function (cx, cy) {
+    const r = canvas.getBoundingClientRect();
+    camera.updateMatrixWorld(true);
+    ndc.set(((cx - r.left) / r.width) * 2 - 1, -((cy - r.top) / r.height) * 2 + 1);
+    raycaster.setFromCamera(ndc, camera);
+    const seen = new Set(), out = [];
+    for (const h of backLast(raycaster.intersectObjects(pickMeshes(), false))) {
+      const u = h.object.userData, k = u.kind + ':' + u.id;
+      if (seen.has(k)) continue; seen.add(k); out.push(h);
+    }
+    return out;
+  };
+  APP.ownerOf = (hit) => { const o = ownerOf(hit.object); if (o.kind === 'body') { const b = APP.getBody(o.id); o.type = b ? b.type : ''; } return o; };
+  function toScreen(p) {
+    const v = new THREE.Vector3(p[0], p[1], p[2]).project(camera);
+    const r = canvas.getBoundingClientRect();
+    return [(v.x + 1) / 2 * r.width + r.left, (1 - v.y) / 2 * r.height + r.top];
+  }
+  function topoOf(mesh) {
+    if (!mesh.userData.topo) mesh.userData.topo = FK.buildTopology(mesh.geometry.attributes.position.array);
+    return mesh.userData.topo;
+  }
+  function ownerOf(mesh) {
+    const u = mesh.userData;
+    if (u.kind === 'stl') { const s = APP.getStl(u.id); return { kind: 'stl', id: u.id, name: s ? s.name : '?', flip: s && s.flip ? -1 : 1 }; }
+    if (u.kind === 'body') { const b = APP.getBody(u.id); return { kind: 'body', id: u.id, name: b ? b.name : '?', flip: 1 }; }
+    const r = APP.getRegion(u.id); return { kind: 'region', id: u.id, name: r ? r.name : '?', flip: 1 };
+  }
+
+  /** Point (snapped vertex or free point) from a hit. */
+  APP.pointFromHit = function (hit, cx, cy, forceSnap) {
+    const mesh = hit.object, topo = topoOf(mesh), tv = FK.triVerts(topo, hit.faceIndex);
+    const hp = [hit.point.x, hit.point.y, hit.point.z];
+    const owner = ownerOf(mesh);
+    if ((S.opt.snap || forceSnap) && S.opt.snapFeat !== false) {   // corner points only
+      const ft = FK.featureVertices(topo, S.opt.sharp || 20), cam = camera.position, H = canvas.getBoundingClientRect().height || 600;
+      const wpp = camera.isOrthographicCamera ? (camera.top - camera.bottom) / camera.zoom / H : Math.hypot(hp[0] - cam.x, hp[1] - cam.y, hp[2] - cam.z) * 2 * Math.tan(camera.fov * Math.PI / 360) / H;
+      let best = null, bd = 1e9;
+      for (let i = 0; i < ft.ids.length; i++) {
+        const o = ft.ids[i] * 3, v = [topo.vpos[o], topo.vpos[o + 1], topo.vpos[o + 2]];
+        if (Math.hypot(v[0] - hp[0], v[1] - hp[1], v[2] - hp[2]) > 45 * wpp) continue;       // behind the surface / far away
+        const s = toScreen(v), d = Math.hypot(s[0] - cx, s[1] - cy); if (d < bd) { bd = d; best = v; }
+      }
+      if (best && bd <= 30) return { kind: 'point', p: best, snapped: true, ownerKind: owner.kind, ownerId: owner.id, ownerName: owner.name };
+    } else if (S.opt.snap || forceSnap) {
+      let best = null, bd = 1e9;
+      for (const v of tv) { const s = toScreen(v); const d = Math.hypot(s[0] - cx, s[1] - cy); if (d < bd) { bd = d; best = v; } }
+      if (best && bd <= 30) return { kind: 'point', p: best, snapped: true, ownerKind: owner.kind, ownerId: owner.id, ownerName: owner.name };
+    }
+    return { kind: 'point', p: hp, snapped: false, ownerKind: owner.kind, ownerId: owner.id, ownerName: owner.name };
+  };
+
+  function segDist(p, a, b) {
+    const ab = V.sub(b, a), t = Math.max(0, Math.min(1, V.dot(V.sub(p, a), ab) / (V.dot(ab, ab) || 1)));
+    return V.dist(p, V.add(a, V.mul(ab, t)));
+  }
+
+  APP.makePick = function (hit, filter, cx, cy, opts) {
+    const mesh = hit.object, topo = topoOf(mesh), tri = hit.faceIndex, tv = FK.triVerts(topo, tri), owner = ownerOf(mesh);
+    const base = { ownerKind: owner.kind, ownerId: owner.id, ownerName: owner.name, mesh, tri };
+    const hp = [hit.point.x, hit.point.y, hit.point.z];
+    if (filter === 'point') return APP.pointFromHit(hit, cx, cy);
+    if (filter === 'edge') {
+      const cosA = Math.cos(S.opt.sharp * Math.PI / 180);
+      let best = -1, bd = 1e18;
+      for (let k = 0; k < 3; k++) {
+        if (S.opt.edgeSharpOnly && !FK.isSharpEdge(topo, tri, k, cosA)) continue;
+        const d = segDist(hp, tv[k], tv[(k + 1) % 3]);
+        if (d < bd) { bd = d; best = k; }
+      }
+      if (best < 0) return Object.assign({ kind: 'edge', none: true }, base);
+      const a = tv[best], b = tv[(best + 1) % 3];
+      let chain = null;
+      const va = topo.vid[tri * 3 + best], vb = topo.vid[tri * 3 + (best + 1) % 3];
+      if (S.opt.edgeSharpOnly) {
+        const ch = FK.edgeChain(topo, va, vb, S.opt.sharp);
+        if (ch.segments > 1) chain = ch;
+      }
+      const pk = Object.assign({ kind: 'edge', a, b, length: V.dist(a, b), chain }, base);
+      if (opts && opts.loop) {          // circular rim: follow the sharp edges around, then fit a circle
+        const tryLoop = (k) => {
+          const x = topo.vid[tri * 3 + k], y = topo.vid[tri * 3 + (k + 1) % 3];
+          let lp = FK.edgeLoop(topo, x, y, S.opt.sharp);
+          if (!lp.closed && lp.segments < 6 && S.opt.edgeSoft !== false) { const alt = FK.edgeLoop(topo, x, y, Math.max(3, S.opt.sharp / 4)); if (alt.segments > lp.segments) lp = alt; }   // softer rim: lower the threshold
+          return { lp, circle: lp.segments >= 3 ? FK.fitCircle3D(lp.pts) : null, k };
+        };
+        let r = tryLoop(best);
+        if (!r.circle) {                // the nearest edge may be an axial wall edge: try the other sharp edges of the same facet
+          for (let k = 0; k < 3; k++) { if (k === best) continue; if (S.opt.edgeSharpOnly && !FK.isSharpEdge(topo, tri, k, cosA)) continue; const q = tryLoop(k); if (q.circle) { r = q; break; } }
+        }
+        pk.loop = r.lp; pk.circle = r.circle;
+      }
+      return pk;
+    }
+    if (filter === 'face') {
+      const tris = S.opt.coplanar ? FK.coplanarPatch(topo, tri, S.opt.coTol) : [tri];
+      const info = FK.patchInfo(topo, tris);
+      let n = FK.triNormal(topo, tri); n = V.mul(n, owner.flip);
+      return Object.assign({ kind: 'face', tris, area: info.area, centroid: info.centroid, bbox: info.bbox, count: info.count, normal: n, seedVerts: tv, seed: tri }, base);
+    }
+    // objet
+    return Object.assign({ kind: 'object', hitPoint: hp }, base);
+  };
+
+  /* ---------- Highlight (selection / hover) ---------- */
+  APP.drawHighlight = function (grp, pk, hover) {
+    clearGroup(grp);
+    if (pk) {
+      const col = hover ? 0x7aa7ff : 0xe11d48;
+      if (pk.kind === 'point') grp.add(markers([pk.p], col, hover ? 10 : 13));
+      else if (pk.kind === 'edge' && !pk.none) {
+        const a = pk.chain ? pk.chain.a : pk.a, b = pk.chain ? pk.chain.b : pk.b;
+        if (pk.loop && pk.loop.segments > 1) {
+          grp.add(polyline(pk.loop.pts, col));
+          if (pk.circle) grp.add(markers([pk.circle.c], col, 12));
+        } else grp.add(polyline([a, b], col), markers([a, b], col, 9));
+      } else if (pk.kind === 'face') {
+        const topo = topoOf(pk.mesh), pos = topo.pos, tris = pk.tris.length > 100000 ? pk.tris.slice(0, 100000) : pk.tris;
+        const arr = new Float32Array(tris.length * 9);
+        tris.forEach((t, i) => { for (let j = 0; j < 9; j++) arr[i * 9 + j] = pos[t * 9 + j]; });
+        const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(arr, 3));
+        const m = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: hover ? 0.3 : 0.5, side: THREE.DoubleSide, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 }));
+        m.raycast = () => {}; m.renderOrder = 8; grp.add(m);
+      } else if (pk.kind === 'object') {
+        const bb = APP.objectStats(pk).bbox;
+        if (bb) {
+          const h = new THREE.Box3Helper(new THREE.Box3(new THREE.Vector3(...bb.min), new THREE.Vector3(...bb.max)), col);
+          h.raycast = () => {}; grp.add(h);
+        }
+      }
+    }
+    needRender = true;
+  };
+  APP.gSel = gSel; APP.gHover = gHover;
+  /** What the renderer would draw right now: [{ layer, kind, id, name }] for every visible mesh / line of the scene. */
+  APP.drawnObjects = function () {
+    const out = [], L = [['mesh', gStl], ['body', gBody], ['region', gRegion], ['overlay', gFeat], ['overlay', gDev], ['overlay', gChk], ['overlay', gPcs], ['overlay', gCut], ['other', scene]];
+    const seen = new Set();
+    for (const [layer, root] of L) {
+      root.traverse(o => {
+        if (seen.has(o) || !(o.isMesh || o.isLine || o.isPoints)) return;
+        let v = true; for (let p = o; p; p = p.parent) if (p.visible === false) { v = false; break; }
+        if (!v) return; seen.add(o);
+        const ud = o.userData || {}; const g = (ud.kind && ud.kind !== 'feat') ? ud : (o.parent && o.parent.userData) || {};
+        out.push({ layer, kind: ud.kind || '', id: ud.id || 0 });
+      });
+    }
+    return out;
+  };
+  APP.clearHover = () => { clearGroup(gHover); needRender = true; };
+
+  /** Statistics of an object (mesh, body or region). */
+  APP.objectStats = function (pk) {
+    if (pk.ownerKind === 'stl') { const s = APP.getStl(pk.ownerId); return s && s.stats ? s.stats : {}; }
+    if (pk.ownerKind === 'body') {
+      const b = APP.getBody(pk.ownerId); if (!b) return {};
+      const c = bodyC.get(b.id);
+      const polys = c && c.polys;
+      const wbd = APP.wbody(b);
+      const bb = FK.bodyBBox(wbd) || (polys && FK.polysBBox(polys)) || null;
+      const vol = FK.bodyVolume(wbd);
+      return { volume: vol, area: polys ? FK.polysArea(polys) : null, bbox: bb, centroid: bb ? FK.boxCenter(bb) : null, count: null, infinite: FK.isInfiniteType(wbd.type) };
+    }
+    const c = regC.get(pk.ownerId);
+    return c ? { volume: c.vol, area: c.area, bbox: c.bbox, centroid: c.bbox ? FK.boxCenter(c.bbox) : null } : {};
+  };
+
+  /* ---------- Render loop ---------- */
+  APP._gl = { renderer, scene, get camera() { return camera; } };
+  let renderFails = 0;
+  function loop() {
+    if (needRender) {
+      needRender = false;
+      try { renderer.render(scene, camera); APP.frames = (APP.frames || 0) + 1; updateLabels(); renderFails = 0; }
+      catch (e) {   // a failing frame must not stop the loop (the canvas would freeze on its last image)
+        renderer.clear(); console.error('Render error:', e);
+        if (renderFails++ < 3 && APP.hooks.toast) APP.hooks.toast('Display error: ' + e.message + ' — try "Redraw the view"');
+      }
+    }
+    requestAnimationFrame(loop);
+  }
+  // GPU context lost (large scenes, driver reset): the canvas would keep showing the last image; rebuild everything when it comes back
+  canvas.addEventListener('webglcontextlost', e => { e.preventDefault(); if (APP.hooks.toast) APP.hooks.toast('Graphics context lost — redrawing when it is back'); });
+  canvas.addEventListener('webglcontextrestored', () => { try { APP.refreshView(); APP.applyStyles(); } catch (e) { console.error(e); } });
+  APP.startLoop = function () { resize(); APP.setProjection(S.opt.proj); loop(); };
+  APP.applyCam = applyCam;
+
+  /* ---------- Section plane visual (see cut.js) ---------- */
+  APP.setCutPlane = function (f, half) {
+    clearGroup(gCut);
+    if (f && half > 0) {
+      const c = (a, b) => new THREE.Vector3(f.o[0] + f.u[0] * a + f.v[0] * b, f.o[1] + f.u[1] * a + f.v[1] * b, f.o[2] + f.u[2] * a + f.v[2] * b);
+      const q = [c(-half, -half), c(half, -half), c(half, half), c(-half, half)];
+      const g = new THREE.BufferGeometry().setFromPoints([q[0], q[1], q[2], q[0], q[2], q[3]]);
+      const m = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: 0xd9480f, transparent: true, opacity: 0.1, side: THREE.DoubleSide, depthWrite: false }));
+      m.raycast = () => {};
+      const l = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(q), new THREE.LineBasicMaterial({ color: 0xd9480f }));
+      l.raycast = () => {};
+      gCut.add(m, l);
+    }
+    needRender = true;
+  };
+})();
